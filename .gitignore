@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Environment Variables & Secrets
+.env
+.flaskenv
+
+# Project Artifacts
+wandb/
+outputs/
+*.pth
+*.log
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/

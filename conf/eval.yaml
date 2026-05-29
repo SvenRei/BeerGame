@@ -1,0 +1,9 @@
+# conf/eval.yaml
+env:
+  horizon: 50
+  max_order: 100
+  holding_cost: 0.5
+  backorder_cost: 1.0
+  lookahead: 4
+  demand_type: "step"     # CRITICAL: Canonical benchmark demand
+  jittery_lead_time: False # CRITICAL: Fixed delays for baseline comparison

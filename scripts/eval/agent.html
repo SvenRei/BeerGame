@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Comm-MAPPO Architecture</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; background: #f4f4f9; }
+        .controls { margin-top: 20px; }
+        button { padding: 10px 20px; cursor: pointer; background: #2c3e50; color: white; border: none; border-radius: 4px; }
+        #canvas { background: white; border: 1px solid #ccc; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+
+    <h2>Comm-MAPPO Actor Architecture</h2>
+    <svg id="canvas" width="800" height="500"></svg>
+
+    <div class="controls">
+        <button onclick="downloadSVG()">Download as SVG</button>
+    </div>
+
+    <script>
+        const svg = document.getElementById('canvas');
+        const layers = [
+            {name: "Input: [Obs ⊕ Comm]", x: 100, y: 250, color: "#bdc3c7"},
+            {name: "FC: Linear + ReLU", x: 250, y: 250, color: "#3498db"},
+            {name: "GRU (Memory)", x: 400, y: 250, color: "#9b59b6"},
+            {name: "Action Head (Linear)", x: 550, y: 150, color: "#e67e22"},
+            {name: "Sigmoid (σ)", x: 700, y: 150, color: "#27ae60"},
+            {name: "Comm Head (Linear)", x: 550, y: 350, color: "#e74c3c"},
+            {name: "Tanh", x: 700, y: 350, color: "#27ae60"}
+        ];
+
+        function draw() {
+            const ctx = svg.innerHTML;
+            
+            // Draw Links
+            const connections = [
+                [0, 1], [1, 2], [2, 3], [3, 4], [2, 5], [5, 6]
+            ];
+            
+            connections.forEach(conn => {
+                const s = layers[conn[0]];
+                const t = layers[conn[1]];
+                svg.innerHTML += `<line x1="${s.x + 60}" y1="${s.y}" x2="${t.x - 60}" y2="${t.y}" stroke="#999" stroke-width="2" />`;
+            });
+
+            // Draw Nodes
+            layers.forEach(layer => {
+                svg.innerHTML += `
+                    <rect x="${layer.x - 60}" y="${layer.y - 30}" width="120" height="60" rx="10" fill="${layer.color}" />
+                    <text x="${layer.x}" y="${layer.y + 5}" text-anchor="middle" fill="white" font-weight="bold">${layer.name}</text>
+                `;
+            });
+        }
+
+        function downloadSVG() {
+            const serializer = new XMLSerializer();
+            const source = serializer.serializeToString(svg);
+            const blob = new Blob([source], {type: "image/svg+xml"});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "comm_mappo_architecture.svg";
+            a.click();
+        }
+
+        draw();
+    </script>
+</body>
+</html>
