@@ -19,3 +19,8 @@ outputs/
 # IDEs
 .vscode/
 .idea/
+# .gitignore
+wandb/
+*.pth
+__pycache__/
+*.csv

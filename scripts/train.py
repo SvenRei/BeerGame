@@ -1,6 +1,7 @@
 import sys, os, torch, wandb, numpy as np
 from omegaconf import DictConfig
 import hydra
+from collections import deque # --- FIX 2: Imported deque for moving average ---
 
 # Add project root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,17 +19,24 @@ def main(cfg: DictConfig):
     local_dim = env.observation_space("retailer").shape[0]
     critic_in = local_dim if algo == "ippo" else local_dim * len(env.agents)
     
-    actor = CommMAPPOActor(local_dim, cfg.agent.hidden_dim) if algo == "comm_mappo" else MAPPOActor(local_dim, cfg.agent.hidden_dim)
-    actor, critic = actor.to(device), MAPPOCritic(critic_in, cfg.agent.hidden_dim).to(device)
+    if algo == "comm_mappo":
+        actor = CommMAPPOActor(local_dim, cfg.agent.hidden_dim).to(device)
+    else:
+        actor = MAPPOActor(local_dim, cfg.agent.hidden_dim).to(device)
+        
+    critic = MAPPOCritic(critic_in, cfg.agent.hidden_dim).to(device)
     
     trainer = MAPPOTrainer(actor, critic, cfg.agent, device, algo)
     
-    # --- STEP 1: SCHEDULER INITIALIZATION ---
     actor_scheduler = torch.optim.lr_scheduler.StepLR(trainer.actor_optimizer, step_size=2000, gamma=0.5)
     critic_scheduler = torch.optim.lr_scheduler.StepLR(trainer.critic_optimizer, step_size=2000, gamma=0.5)
     
-    best_cost, patience, since_imp = float('inf'), 500, 0
+    patience, since_imp = 500, 0
     warm_up = cfg.agent.get("warm_up_episodes", 1000)
+    
+    # --- FIX 2: Set up the moving average trackers ---
+    cost_history = deque(maxlen=50)
+    best_avg_cost = float('inf')
 
     print(f"--- Starting {algo.upper()} Training Marathon ---")
     print(f"Warm-up Phase: {warm_up} episodes | Early Stopping active after warm-up.")
@@ -40,6 +48,9 @@ def main(cfg: DictConfig):
         msg = {a: torch.zeros(1, 1).to(device) for a in env.agents}
         ep_cost = 0.0
         
+        # Keep track of agent costs for this episode
+        ep_agent_costs = {a: 0.0 for a in env.agents}
+        
         while True:
             acts, next_msg = {}, {}
             sorted_agents = sorted(env.agents)
@@ -50,7 +61,7 @@ def main(cfg: DictConfig):
                 with torch.no_grad():
                     if algo == "comm_mappo":
                         dist, comm, next_h = actor(o_t, msg[a], hidden[a])
-                        if i < len(env.agents)-1: next_msg[env.agents[i+1]] = comm
+                        if i < len(env.agents) - 1: next_msg[env.agents[i+1]] = comm
                     else:
                         dist, next_h = actor(o_t, hidden[a])
                 
@@ -62,41 +73,79 @@ def main(cfg: DictConfig):
                 buffer.actions.append(action_val.detach())
                 buffer.log_probs.append(dist.log_prob(action_val).detach())
                 buffer.global_states.append(torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device))
-                if algo == "comm_mappo": buffer.comm_in.append(msg[a])
+                
+                if algo == "comm_mappo": 
+                    buffer.comm_in.append(msg[a])
                 hidden[a] = next_h
             
-            msg = next_msg; msg["retailer"] = torch.zeros(1, 1).to(device)
-            obs, rewards, terms, _, _ = env.step(acts)
-            ep_cost -= rewards["retailer"]
+            msg = next_msg
+            msg["retailer"] = torch.zeros(1, 1).to(device)
+            
+            obs, rewards, terms, truncs, infos = env.step(acts)
+            
+            ep_cost -= rewards["retailer"] 
+            
             for a in env.agents: 
-                buffer.rewards.append(rewards[a])
+                local_cost = infos.get(a, {}).get("local_cost", 0.0)
+                ep_agent_costs[a] += local_cost 
+                
+                if algo == "ippo":
+                    raw_cost = abs(local_cost)
+                else:
+                    raw_cost = abs(rewards[a])
+                
+                # Linear Scaling
+                scaled_reward = -raw_cost / 100.0 
+                buffer.rewards.append(scaled_reward)
                 buffer.is_terminals.append(terms[a])
+                
             if any(terms.values()): break
             
-        # --- STEP 2: UPDATE TRAINER (Pass 'ep' for Warm-Up Logic) & SCHEDULER ---
         actor_loss, critic_loss = trainer.update(buffer, ep)
         
-        # Step the schedulers
+        # --- FIX 1: Removed trainer.decay_action_std(ep, cfg.total_episodes) ---
+        
         actor_scheduler.step()
         critic_scheduler.step()
         
-        wandb.log({
+        # --- LOGGING: AGENT-SPECIFIC COSTS ---
+        log_dict = {
             "Cost": ep_cost, 
             "Actor_Loss": actor_loss, 
             "Critic_Loss": critic_loss,
             "Actor_LR": actor_scheduler.get_last_lr()[0]
-        })
+        }
+        for a, cost in ep_agent_costs.items():
+            log_dict[f"Cost/{a}"] = cost
+            
+        wandb.log(log_dict)
         
-        if ep_cost < best_cost: 
-            best_cost = ep_cost; since_imp = 0; torch.save(actor.state_dict(), f"{algo}_best.pth")
-        else: since_imp += 1
+        # --- FIX 2: Moving-Average Early Stopping Logic ---
+        cost_history.append(ep_cost)
+        avg_cost = sum(cost_history) / len(cost_history)
         
-        # --- FIX: EARLY STOPPING ONLY AFTER WARM-UP ---
+        if ep == warm_up:
+            print(f"--- Ep {ep}: Warm-up complete! Resetting early stopping baseline. ---")
+            best_avg_cost = float('inf')
+            since_imp = 0
+            
+        # Compare AVERAGE cost instead of single episode cost
+        if avg_cost < best_avg_cost and len(cost_history) == 50: 
+            best_avg_cost = avg_cost
+            since_imp = 0
+            if ep >= warm_up:
+                torch.save(actor.state_dict(), f"{algo}_best.pth")
+        else: 
+            if ep >= warm_up: 
+                since_imp += 1
+        
         if ep > warm_up and since_imp >= patience: 
-            print(f"Stopping early at Ep {ep}: No improvement for {patience} episodes after warm-up.")
+            print(f"Stopping early at Ep {ep}: No improvement in 50-Ep Avg Cost for {patience} episodes.")
             break
             
-        if ep % 10 == 0: print(f"Ep {ep} | Cost: {ep_cost:.2f} | Best: {best_cost:.2f}")
+        if ep % 10 == 0: 
+            best_display = best_avg_cost if best_avg_cost != float('inf') else 0.0
+            print(f"Ep {ep} | Cost: {ep_cost:.2f} | 50-Ep Avg: {avg_cost:.2f} | Best Avg: {best_display:.2f}")
     
     wandb.finish()
 

@@ -20,14 +20,19 @@ class MAPPOActor(nn.Module):
         self.fc = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=False)
         self.action_mean = nn.Linear(hidden_dim, 1)
-        self.action_log_std = nn.Parameter(torch.zeros(1, 1))
+        # --- FIX: Bound initial exploration noise ---
+        self.action_log_std = nn.Parameter(torch.full((1, 1), -1.0)) 
+        
+        # --- SMART BIAS INITIALIZATION ---
+        nn.init.orthogonal_(self.action_mean.weight, gain=0.01)
+        # --- FIX: Set bias to -0.75 for Linear Mapping (starts at ~32 units) ---
+        nn.init.constant_(self.action_mean.bias, -0.75)
 
     def forward(self, obs, hidden):
         x = self.fc(obs).unsqueeze(0)
         x, hidden = self.gru(x, hidden)
         x = x.squeeze(0)
         
-        # SIGMOID FIX: Forces the mean action into [0, 1] range to avoid exploits
         mean = torch.sigmoid(self.action_mean(x))
         std = self.action_log_std.exp().expand_as(mean)
         return Normal(mean, std), hidden
@@ -39,8 +44,14 @@ class CommMAPPOActor(nn.Module):
         self.fc = nn.Sequential(nn.Linear(obs_dim + comm_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=False)
         self.action_mean = nn.Linear(hidden_dim, 1)
-        self.action_log_std = nn.Parameter(torch.zeros(1, 1))
+        # --- FIX: Bound initial exploration noise ---
+        self.action_log_std = nn.Parameter(torch.full((1, 1), -1.0)) 
         self.comm_head = nn.Sequential(nn.Linear(hidden_dim, comm_dim), nn.Tanh())
+
+        # --- SMART BIAS INITIALIZATION ---
+        nn.init.orthogonal_(self.action_mean.weight, gain=0.01)
+        # --- FIX: Set bias to -0.75 for Linear Mapping (starts at ~32 units) ---
+        nn.init.constant_(self.action_mean.bias, -0.75)
 
     def forward(self, obs, comm_in, hidden):
         x = torch.cat([obs, comm_in], dim=-1).unsqueeze(0)
@@ -67,15 +78,16 @@ class MAPPOTrainer:
         self.actor, self.critic, self.device, self.algo = actor, critic, device, algo
         self.gamma = cfg.get("gamma", 0.99)
         self.entropy_coef = cfg.get("entropy_coef", 0.05)
-        # CONFIG: Penalty strength and warm-up duration
         self.comm_penalty_coef = cfg.get("comm_penalty_coef", 0.001) 
         self.warm_up_episodes = cfg.get("warm_up_episodes", 1000)
         
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.get("lr_actor", 3e-4))
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=cfg.get("lr_critic", 1e-3))
-        self.max_grad_norm = 0.5 
+        
+        # FIX 3: Tightened Gradient Clipping
+        self.max_grad_norm = 0.2 
 
-    def update(self, buffer, current_ep): # Added current_ep parameter
+    def update(self, buffer, current_ep):
         obs = torch.cat(buffer.local_obs).detach()
         hiddens = torch.cat(buffer.hidden_states).detach().transpose(0, 1)
         actions = torch.cat(buffer.actions).detach()
@@ -91,6 +103,10 @@ class MAPPOTrainer:
             returns[i] = r + (self.gamma * next_discounted * (1 - term))
             
         returns = torch.tensor(returns, dtype=torch.float32).to(self.device).unsqueeze(1)
+        
+        # --- CRITICAL FIX: Standard Normalization ---
+        # This converts massive linear costs into a stable (-1 to 1) gradient signal
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         
         # PPO Update Loop
         for _ in range(4):
@@ -110,7 +126,6 @@ class MAPPOTrainer:
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
             
-            # Combine losses
             actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * dist.entropy().mean()
             
             # --- INFORMATION BOTTLENECK WITH WARM-UP ---
@@ -121,7 +136,6 @@ class MAPPOTrainer:
 
             critic_loss = nn.MSELoss()(values, returns)
 
-            # Gradient Descent steps
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)

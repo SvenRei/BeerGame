@@ -15,6 +15,20 @@ sys.path.append(PROJECT_ROOT)
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.rl.mappo import MAPPOActor, CommMAPPOActor
 
+# --- NEW: Information Theory Metric ---
+def calc_mutual_information(x, y, bins=10):
+    """Calculates Mutual Information to measure how much the message reduces uncertainty about the backlog."""
+    if len(x) == 0 or len(y) == 0: return 0.0
+    c_xy, _, _ = np.histogram2d(x, y, bins)
+    c_xy = c_xy / np.sum(c_xy) # Normalize to probabilities
+    p_x, p_y = np.sum(c_xy, axis=1), np.sum(c_xy, axis=0)
+    mi = 0.0
+    for i in range(bins):
+        for j in range(bins):
+            if c_xy[i, j] > 0:
+                mi += c_xy[i, j] * np.log(c_xy[i, j] / (p_x[i] * p_y[j]))
+    return mi
+
 def cohens_d(x, y):
     n1, n2 = len(x), len(y)
     var1, var2 = np.var(x, ddof=1), np.var(y, ddof=1)
@@ -36,13 +50,19 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
         actor.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         actor.eval()
     
-    costs, episode_bullwhip_ratios, episode_comm_corrs = [], [], []
+    costs, episode_bullwhip_ratios = [], []
+    episode_jitters, episode_sparsities, episode_mis = [], [], []
     raw_actor_floats = [] 
     
     for ep in range(num_episodes):
         obs, _ = env.reset(seed=2000 + ep) 
         hidden, msg, ep_cost = {a: torch.zeros(1, 1, 128) for a in env.agents}, {a: torch.zeros(1, 1) for a in env.agents}, 0
         m_orders, r_demands, ep_ret_backlogs, ep_ret_msgs = [], [], [], []
+        
+        # Tracking for new metrics
+        prev_acts = None
+        ep_step_jitters = []
+        ep_all_msgs = []
         
         while True:
             acts = {}
@@ -57,6 +77,8 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
                         if algo == "comm_mappo":
                             dist, comm, next_h = actor(o_t, msg[a], hidden[a])
                             if i < len(env.agents)-1: next_msg[env.agents[i+1]] = comm
+                            
+                            ep_all_msgs.append(comm.item())
                             if a == "retailer":
                                 ep_ret_msgs.append(comm.item())
                                 ep_ret_backlogs.append(obs[a][1]) 
@@ -68,13 +90,18 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
                     if ep == 0 and env.current_step < 3 and a == "retailer":
                         raw_actor_floats.append(acts[a][0])
             
+            # --- NEW: Calculate Action Volatility (Jitter) ---
+            if prev_acts is not None:
+                step_jitter = np.mean([abs(acts[a][0] - prev_acts[a]) for a in env.agents])
+                ep_step_jitters.append(step_jitter)
+            prev_acts = {a: acts[a][0] for a in env.agents}
+            
             msg = next_msg
             msg["retailer"] = torch.zeros(1, 1) 
             
             scaled_m_order = int(np.round(np.clip(acts["manufacturer"][0], 0.0, 1.0) * env.max_order))
             m_orders.append(scaled_m_order)
             
-            # --- NEW DEMAND TRACKING FOR ALL SCENARIOS ---
             if scenario_type == "step": 
                 true_demand = 4 if env.current_step < 4 else 8
             elif scenario_type == "black_swan": 
@@ -83,7 +110,7 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
                 if env.current_step < 10: true_demand = 8
                 elif env.current_step < 20: true_demand = 30
                 elif env.current_step < 30: true_demand = 0
-                else: true_demand = 15 # The expected mean of the random (5, 25) range
+                else: true_demand = 15
             else: 
                 true_demand = 8  
                 
@@ -96,16 +123,27 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
         var_demand = np.var(r_demands)
         episode_bullwhip_ratios.append(np.var(m_orders) / var_demand if var_demand > 0 else 1.0)
         
-        if algo == "comm_mappo" and len(ep_ret_msgs) > 1 and np.var(ep_ret_backlogs) > 0:
-            corr, _ = stats.spearmanr(ep_ret_msgs, ep_ret_backlogs)
-            episode_comm_corrs.append(corr if not np.isnan(corr) else 0.0)
-        else:
-            episode_comm_corrs.append(0.0)
+        # Save Volatility (Jitter)
+        episode_jitters.append(np.mean(ep_step_jitters) if ep_step_jitters else 0.0)
+        
+        if algo == "comm_mappo":
+            # Save Sparsity Index (percentage of signals acting as "dead air" near zero)
+            sparsity = np.mean(np.abs(ep_all_msgs) < 0.05) if ep_all_msgs else 0.0
+            episode_sparsities.append(sparsity)
             
-    return np.array(costs), np.array(episode_bullwhip_ratios), np.array(episode_comm_corrs), raw_actor_floats
+            # Save Mutual Information (Retailer Message vs Retailer Backlog)
+            if len(ep_ret_msgs) > 1 and np.var(ep_ret_backlogs) > 0:
+                mi = calc_mutual_information(ep_ret_msgs, ep_ret_backlogs)
+                episode_mis.append(mi)
+            else:
+                episode_mis.append(0.0)
+        else:
+            episode_sparsities.append(0.0)
+            episode_mis.append(0.0)
+            
+    return np.array(costs), np.array(episode_bullwhip_ratios), np.array(episode_jitters), np.array(episode_sparsities), np.array(episode_mis), raw_actor_floats
 
 if __name__ == "__main__":
-    # --- ADDED 'extreme_chaos' TO THE SCENARIOS LIST ---
     scenarios = ["step", "poisson", "black_swan", "extreme_chaos"]
     configs = {
         "sterman_heuristic": None, 
@@ -118,24 +156,28 @@ if __name__ == "__main__":
     print("\n=======================================================")
     print("    LAUNCHING MULTI-SCENARIO ACADEMIC BENCHMARK        ")
     print(f"    PROJECT ROOT: {PROJECT_ROOT}")
+    print("    ZERO-SHOT TRANSFER: Base weights trained on POISSON")
     print("=======================================================")
 
     for scenario in scenarios:
         print(f"\n---> Executing Test Scenario: [{scenario.upper()}]")
-        results, comm_correlations = {}, []
+        results, final_sparsities, final_mis = {}, [], []
         
         for k, v in configs.items():
             if v is None:
                 print(f"  -> Running {k.upper()} (Baseline)")
-                costs, bw_ratios, comm_corrs, raw_floats = run_benchmark(k, v, scenario_type=scenario)
-                results[k] = (costs, bw_ratios)
+                costs, bw_ratios, jitters, sparsities, mis, raw_floats = run_benchmark(k, v, scenario_type=scenario)
+                results[k] = {"costs": costs, "bw": bw_ratios, "jitter": jitters}
             else:
                 abs_path = os.path.join(PROJECT_ROOT, v)
                 if os.path.exists(abs_path):
                     print(f"  -> Running {k.upper()} (Found weights: {abs_path})")
-                    costs, bw_ratios, comm_corrs, raw_floats = run_benchmark(k, abs_path, scenario_type=scenario)
-                    results[k] = (costs, bw_ratios)
-                    if k == "comm_mappo": comm_correlations = comm_corrs
+                    costs, bw_ratios, jitters, sparsities, mis, raw_floats = run_benchmark(k, abs_path, scenario_type=scenario)
+                    results[k] = {"costs": costs, "bw": bw_ratios, "jitter": jitters}
+                    
+                    if k == "comm_mappo": 
+                        final_sparsities = sparsities
+                        final_mis = mis
                     
                     if scenario == "step":
                         print(f"    [Diagnostic] {k.upper()} Raw Network Floats (Steps 1-3): {[f'{val:.6f}' for val in raw_floats]}")
@@ -149,24 +191,27 @@ if __name__ == "__main__":
             all_scenario_summaries.append({
                 "Scenario": scenario.upper(),
                 "Algo": k.upper(),
-                "Mean Cost": np.mean(v[0]),
-                "Std Dev": np.std(v[0]),
-                "Robustness (CV)": np.std(v[0]) / np.mean(v[0]) if np.mean(v[0]) != 0 else 0,
-                "Bullwhip Ratio": np.mean(v[1])
+                "Mean Cost": np.mean(v["costs"]),
+                "Robustness (CV)": np.std(v["costs"]) / np.mean(v["costs"]) if np.mean(v["costs"]) != 0 else 0,
+                "Bullwhip Ratio": np.mean(v["bw"]),
+                "Action Volatility": np.mean(v["jitter"]),
+                "Sparsity Index": np.mean(final_sparsities) if k == "comm_mappo" else 0.0,
+                "Mutual Info": np.mean(final_mis) if k == "comm_mappo" else 0.0
             })
             
-        if len(comm_correlations) > 0:
+        if len(final_mis) > 0:
             print(f"\n=== COMM-MAPPO LATENT SPACE ANALYSIS ({scenario.upper()}) ===")
-            print(f"  -> Mean Spearman Correlation (Retailer Msg vs. Backlog): {np.mean(comm_correlations):.4f}")
+            print(f"  -> Signal Sparsity Index (Muted ratio): {np.mean(final_sparsities):.2%}")
+            print(f"  -> Mutual Information (Message vs Backlog): {np.mean(final_mis):.4f} bits")
 
         if len(results) >= 2:
             print("\n=== ASSUMPTION TESTING: NORMALITY (Shapiro-Wilk) ===")
             for algo in results.keys():
                 try:
-                    if np.var(results[algo][0]) == 0:
+                    if np.var(results[algo]["costs"]) == 0:
                         print(f"  {algo.upper()}: Deterministic (Zero Variance) -> NON-NORMAL")
                     else:
-                        _, p_norm = stats.shapiro(results[algo][0])
+                        _, p_norm = stats.shapiro(results[algo]["costs"])
                         print(f"  {algo.upper()}: p-value = {p_norm:.4e} -> {'NON-NORMAL' if p_norm < 0.05 else 'NORMAL'}")
                 except Exception:
                     print(f"  {algo.upper()}: Test failed (likely identical values)")
@@ -174,10 +219,10 @@ if __name__ == "__main__":
             print("\n=== VARIANCE ANALYSIS: SYSTEMIC VOLATILITY (Ansari-Bradley) ===")
             if "sterman_heuristic" in results and "comm_mappo" in results:
                 try:
-                    if np.var(results["sterman_heuristic"][0]) == 0 and np.var(results["comm_mappo"][0]) == 0:
+                    if np.var(results["sterman_heuristic"]["costs"]) == 0 and np.var(results["comm_mappo"]["costs"]) == 0:
                         print("  Sterman vs Comm-MAPPO Variance p-value: N/A (Both are perfectly deterministic)")
                     else:
-                        _, p_var = stats.ansari(results["sterman_heuristic"][0], results["comm_mappo"][0])
+                        _, p_var = stats.ansari(results["sterman_heuristic"]["costs"], results["comm_mappo"]["costs"])
                         print(f"  Sterman vs Comm-MAPPO Variance p-value: {p_var:.4e}")
                 except Exception:
                     print("  Sterman vs Comm-MAPPO Variance p-value: N/A (Test failed due to ties)")
@@ -188,14 +233,13 @@ if __name__ == "__main__":
 
             for a, b in pairs:
                 try:
-                    diff = np.array(results[a][0]) - np.array(results[b][0])
+                    diff = np.array(results[a]["costs"]) - np.array(results[b]["costs"])
                     if np.all(diff == 0): p_val = 1.0
-                    else: p_val = stats.wilcoxon(results[a][0], results[b][0]).pvalue
+                    else: p_val = stats.wilcoxon(results[a]["costs"], results[b]["costs"]).pvalue
                 except Exception:
                     p_val = 1.0
                 raw_p_values.append(p_val)
 
-            from scipy.stats import rankdata
             n_tests = len(raw_p_values)
             sort_idx = np.argsort(raw_p_values)
             adjusted_p_vals = np.zeros(n_tests)
@@ -207,10 +251,10 @@ if __name__ == "__main__":
 
         # Visualization
         plt.figure(figsize=(10, 6))
-        flat_data = pd.DataFrame([(k.upper(), v_i) for k, v in results.items() for v_i in v[0]], columns=['Topology', 'Cost'])
+        flat_data = pd.DataFrame([(k.upper(), v_i) for k, v in results.items() for v_i in v["costs"]], columns=['Topology', 'Cost'])
         sns.boxplot(x='Topology', y='Cost', hue='Topology', data=flat_data, palette="viridis", legend=False)
         if "sterman_heuristic" in results:
-            plt.axhline(y=np.mean(results["sterman_heuristic"][0]), color='r', linestyle='--', label="Sterman Mean Baseline")
+            plt.axhline(y=np.mean(results["sterman_heuristic"]["costs"]), color='r', linestyle='--', label="Sterman Mean Baseline")
         plt.title(f"Statistical Cost Distributions under Scenario: {scenario.upper()}")
         plt.legend()
         plt.tight_layout()
@@ -222,7 +266,7 @@ if __name__ == "__main__":
     print("\n=======================================================")
     print("--- FINAL MANUSCRIPT MASTER DATA TABLE ---")
     print("=======================================================")
-    print(master_df.round(2).to_string())
+    print(master_df.round(4).to_string())
     
     master_df.to_csv("master_benchmark_results.csv")
     print("\n-> Saved 'master_benchmark_results.csv' successfully.")
