@@ -75,7 +75,6 @@ class BeerGameParallelEnv(ParallelEnv):
             raw_action = float(np.clip(actions[agent][0], 0.0, 1.0))
             
             # --- FIX: Linear Action Mapping ---
-            # Standard linear scaling provides a constant, predictable gradient across the entire action spectrum.
             target_base_stock = raw_action * self.max_order
             
             # Compute total items currently in transit (pipeline inventory)
@@ -141,9 +140,13 @@ class BeerGameParallelEnv(ParallelEnv):
         self.current_step += 1
         done = self.current_step >= self.horizon
         
-        # Assign Cooperative Reward Structure
+        # --- FIX: Mixed Reward Shaping ---
+        # alpha = 0.5 mathematically blends immediate local survival with global cooperation
+        alpha = self.config.get("reward_alpha", 0.5)
         for a in self.agents:
-            rewards[a] = -total_system_cost
+            local_penalty = infos[a]["local_cost"]
+            # The agent is punished for its own mistakes, PLUS a weighted penalty for the team's mistakes
+            rewards[a] = -local_penalty - (alpha * total_system_cost)
             terminations[a] = done
             truncations[a] = False
 

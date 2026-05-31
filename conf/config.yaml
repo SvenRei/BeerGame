@@ -10,16 +10,17 @@ env:
   lookahead: 4
   demand_type: "poisson"
   jittery_lead_time: False
+  reward_alpha: 0.1      # FIX 1: Softened Cooperation Weight (prevents global punishment from crushing local learning)
 
 agent:
   algorithm: "comm_mappo"
-  hidden_dim: 128
+  hidden_dim: 256        # FIX 2: Doubled capacity so the Centralized Critic can process 24 dimensions
   lr_actor: 3e-4
   lr_critic: 1e-3
   gamma: 0.99
   k_epochs: 4
   eps_clip: 0.1
-  entropy_coef: 0.01
-  max_grad_norm: 0.2       # Moved from script to config
-  comm_penalty_coef: 0.0001  # Information Bottleneck coefficient
+  entropy_coef: 0.10     # FIX 3: Massive increase to force exploration and escape the Zero-Order Trap
+  max_grad_norm: 0.2
+  comm_penalty_coef: 0.0001
   warm_up_episodes: 1000

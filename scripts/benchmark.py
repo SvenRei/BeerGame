@@ -46,7 +46,8 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
     
     if algo != "sterman_heuristic":
         local_dim = env.observation_space("retailer").shape[0]
-        actor = CommMAPPOActor(local_dim, 128) if algo == "comm_mappo" else MAPPOActor(local_dim, 128)
+        # --- FIX: Match the hidden_dim to the new 256-width architecture ---
+        actor = CommMAPPOActor(local_dim, 256) if algo == "comm_mappo" else MAPPOActor(local_dim, 256)
         actor.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         actor.eval()
     
@@ -56,7 +57,12 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
     
     for ep in range(num_episodes):
         obs, _ = env.reset(seed=2000 + ep) 
-        hidden, msg, ep_cost = {a: torch.zeros(1, 1, 128) for a in env.agents}, {a: torch.zeros(1, 1) for a in env.agents}, 0
+        
+        # --- FIX: Updated the GRU hidden state initialization to 256 ---
+        hidden = {a: torch.zeros(1, 1, 256) for a in env.agents}
+        msg = {a: torch.zeros(1, 1) for a in env.agents}
+        ep_cost = 0
+        
         m_orders, r_demands, ep_ret_backlogs, ep_ret_msgs = [], [], [], []
         
         # Tracking for new metrics
@@ -75,15 +81,22 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
                     with torch.no_grad():
                         o_t = torch.tensor(obs[a], dtype=torch.float32).unsqueeze(0)
                         if algo == "comm_mappo":
-                            dist, comm, next_h = actor(o_t, msg[a], hidden[a])
-                            if i < len(env.agents)-1: next_msg[env.agents[i+1]] = comm
+                            dist, dist_comm, next_h = actor(o_t, msg[a], hidden[a])
                             
-                            ep_all_msgs.append(comm.item())
+                            # --- CRITICAL FIX: Extract deterministic message from Categorical Distribution ---
+                            comm_idx = torch.argmax(dist_comm.probs, dim=-1)
+                            vocab = torch.tensor([-1.0, 0.0, 1.0])
+                            comm_val = vocab[comm_idx].view(1, 1)
+                            
+                            if i < len(env.agents)-1: next_msg[env.agents[i+1]] = comm_val
+                            
+                            ep_all_msgs.append(comm_val.item())
                             if a == "retailer":
-                                ep_ret_msgs.append(comm.item())
+                                ep_ret_msgs.append(comm_val.item())
                                 ep_ret_backlogs.append(obs[a][1]) 
                         else: 
                             dist, next_h = actor(o_t, hidden[a])
+                    
                     acts[a] = [dist.mean.item()]
                     hidden[a] = next_h
                     
@@ -115,8 +128,10 @@ def run_benchmark(algo, model_path, scenario_type, num_episodes=100):
                 true_demand = 8  
                 
             r_demands.append(true_demand)
-            obs, rewards, terms, _, _ = env.step(acts)
-            ep_cost -= rewards["retailer"]
+            obs, rewards, terms, _, infos = env.step(acts)
+            true_step_cost = sum(infos[a]["local_cost"] for a in env.agents)
+            ep_cost += true_step_cost
+            
             if any(terms.values()): break
             
         costs.append(ep_cost)

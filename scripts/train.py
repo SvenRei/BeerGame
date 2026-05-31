@@ -1,9 +1,8 @@
 import sys, os, torch, wandb, numpy as np
 from omegaconf import DictConfig
 import hydra
-from collections import deque # --- FIX 2: Imported deque for moving average ---
+from collections import deque 
 
-# Add project root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.rl.mappo import MAPPOActor, CommMAPPOActor, MAPPOCritic, MAPPOTrainer, RolloutBuffer
@@ -26,7 +25,7 @@ def main(cfg: DictConfig):
         
     critic = MAPPOCritic(critic_in, cfg.agent.hidden_dim).to(device)
     
-    trainer = MAPPOTrainer(actor, critic, cfg.agent, device, algo)
+    trainer = MAPPOTrainer(actor, critic, cfg.agent, cfg.total_episodes, device, algo)
     
     actor_scheduler = torch.optim.lr_scheduler.StepLR(trainer.actor_optimizer, step_size=2000, gamma=0.5)
     critic_scheduler = torch.optim.lr_scheduler.StepLR(trainer.critic_optimizer, step_size=2000, gamma=0.5)
@@ -34,7 +33,6 @@ def main(cfg: DictConfig):
     patience, since_imp = 500, 0
     warm_up = cfg.agent.get("warm_up_episodes", 1000)
     
-    # --- FIX 2: Set up the moving average trackers ---
     cost_history = deque(maxlen=50)
     best_avg_cost = float('inf')
 
@@ -48,7 +46,6 @@ def main(cfg: DictConfig):
         msg = {a: torch.zeros(1, 1).to(device) for a in env.agents}
         ep_cost = 0.0
         
-        # Keep track of agent costs for this episode
         ep_agent_costs = {a: 0.0 for a in env.agents}
         
         while True:
@@ -60,8 +57,20 @@ def main(cfg: DictConfig):
                 o_t = torch.tensor(obs[a], dtype=torch.float32).unsqueeze(0).to(device)
                 with torch.no_grad():
                     if algo == "comm_mappo":
-                        dist, comm, next_h = actor(o_t, msg[a], hidden[a])
-                        if i < len(env.agents) - 1: next_msg[env.agents[i+1]] = comm
+                        dist, dist_comm, next_h = actor(o_t, msg[a], hidden[a])
+                        
+                        comm_idx = dist_comm.sample()
+                        # Map categorical choice to vocabulary: -1.0, 0.0, 1.0
+                        vocab = torch.tensor([-1.0, 0.0, 1.0], device=device)
+                        comm_val = vocab[comm_idx].view(1, 1) 
+                        
+                        # --- FIX B: 10% LATENT CHANNEL DROPOUT ---
+                        # Simulates packet loss. Forces the receiver to stay adaptable 
+                        # and prevents the sender from building a "Dial Tone" bridge.
+                        if torch.rand(1).item() < 0.10:
+                            comm_val = torch.tensor([[0.0]], dtype=torch.float32, device=device) # Force Silence
+                        
+                        if i < len(env.agents) - 1: next_msg[env.agents[i+1]] = comm_val
                     else:
                         dist, next_h = actor(o_t, hidden[a])
                 
@@ -71,11 +80,16 @@ def main(cfg: DictConfig):
                 buffer.local_obs.append(o_t)
                 buffer.hidden_states.append(hidden[a])
                 buffer.actions.append(action_val.detach())
-                buffer.log_probs.append(dist.log_prob(action_val).detach())
                 buffer.global_states.append(torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device))
                 
                 if algo == "comm_mappo": 
                     buffer.comm_in.append(msg[a])
+                    buffer.comm_actions.append(comm_idx.detach())
+                    combined_log_prob = dist.log_prob(action_val) + dist_comm.log_prob(comm_idx)
+                    buffer.log_probs.append(combined_log_prob.detach())
+                else:
+                    buffer.log_probs.append(dist.log_prob(action_val).detach())
+                    
                 hidden[a] = next_h
             
             msg = next_msg
@@ -83,7 +97,8 @@ def main(cfg: DictConfig):
             
             obs, rewards, terms, truncs, infos = env.step(acts)
             
-            ep_cost -= rewards["retailer"] 
+            true_step_cost = sum(infos[a]["local_cost"] for a in env.agents)
+            ep_cost += true_step_cost
             
             for a in env.agents: 
                 local_cost = infos.get(a, {}).get("local_cost", 0.0)
@@ -94,7 +109,6 @@ def main(cfg: DictConfig):
                 else:
                     raw_cost = abs(rewards[a])
                 
-                # Linear Scaling
                 scaled_reward = -raw_cost / 100.0 
                 buffer.rewards.append(scaled_reward)
                 buffer.is_terminals.append(terms[a])
@@ -103,12 +117,9 @@ def main(cfg: DictConfig):
             
         actor_loss, critic_loss = trainer.update(buffer, ep)
         
-        # --- FIX 1: Removed trainer.decay_action_std(ep, cfg.total_episodes) ---
-        
         actor_scheduler.step()
         critic_scheduler.step()
         
-        # --- LOGGING: AGENT-SPECIFIC COSTS ---
         log_dict = {
             "Cost": ep_cost, 
             "Actor_Loss": actor_loss, 
@@ -120,7 +131,6 @@ def main(cfg: DictConfig):
             
         wandb.log(log_dict)
         
-        # --- FIX 2: Moving-Average Early Stopping Logic ---
         cost_history.append(ep_cost)
         avg_cost = sum(cost_history) / len(cost_history)
         
@@ -129,7 +139,6 @@ def main(cfg: DictConfig):
             best_avg_cost = float('inf')
             since_imp = 0
             
-        # Compare AVERAGE cost instead of single episode cost
         if avg_cost < best_avg_cost and len(cost_history) == 50: 
             best_avg_cost = avg_cost
             since_imp = 0
