@@ -1,0 +1,39 @@
+# ==============================================================================
+# QMIX ALGORITHM CONFIGURATION
+# ==============================================================================
+# Name of the algorithm used for logging and logic routing
+algorithm: "qmix"
+# Size of the hidden memory state (GRU) for the local agents
+hidden_dim: 256
+
+# --- FIX 1: INCREASED GRANULARITY ---
+# Increased from 21 to 51. The agent can now step in increments of 2 units.
+# This prevents the agent from hiding in a "safe" 10-unit wide bin.
+n_actions: 51
+
+# Internal embedding size for the central mixing network
+mixing_embed_dim: 256
+# Internal embedding size for the hypernetwork weight generator
+hypernet_embed: 64
+# Maximum number of past experiences to store in the off-policy memory
+buffer_size: 50000
+# Number of past experiences to sample for each gradient descent step
+batch_size: 32
+# Discount factor for future rewards (how much the agent cares about the long term)
+gamma: 0.99
+# How often (in total steps) to copy online weights to the stable target network
+target_update_freq: 200
+# Learning rate for the Adam optimizer updating the networks
+lr: 0.0001
+# Starting exploration rate (1.0 = 100% random actions)
+epsilon_start: 1.0
+# Minimum exploration rate (0.05 = 5% random actions to prevent getting stuck)
+epsilon_end: 0.05
+# Over how many episodes the exploration rate decays from start to end
+epsilon_decay_episodes: 5000
+# Number of initial episodes to play purely to fill the buffer before evaluating
+warm_up_episodes: 1000
+
+# --- FIX 2: EXTENDED PATIENCE ---
+# Increased to 2000 to account for the highly volatile nature of Off-Policy MARL
+patience: 2000

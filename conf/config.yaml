@@ -1,26 +1,35 @@
+# ==============================================================================
+# MASTER HYDRA CONFIGURATION
+# ==============================================================================
+# The defaults block instructs Hydra to compose the config dynamically
+defaults:
+  # Tell Hydra to look in the 'agent' folder and load 'qmix.yaml' by default
+  - agent: qmix
+  # Load the master file itself
+  - _self_
+
+# Global project name for Weights & Biases logging
 project_name: "beer_game_marl"
+# Global random seed to ensure reproducibility of environments and networks
 seed: 42
-total_episodes: 15000  # Increased for full convergence
+# Absolute maximum number of training episodes before forcing termination
+total_episodes: 15000
 
+# Global Supply Chain Environment Settings
 env:
+  # Number of weeks in a single episode
   horizon: 50
+  # Absolute physical limit on how many units an agent can order per step
   max_order: 100
+  # Financial penalty applied per unit of overstock inventory per week
   holding_cost: 0.5
+  # Financial penalty applied per unit of starving backlog per week
   backorder_cost: 1.0
+  # The fixed physical transit/delay time between supply chain nodes
   lookahead: 4
+  # The mathematical distribution defining end-consumer demand behavior
   demand_type: "poisson"
+  # Toggle to introduce stochastic noise into the 4-week delay
   jittery_lead_time: False
-  reward_alpha: 0.1      # FIX 1: Softened Cooperation Weight (prevents global punishment from crushing local learning)
-
-agent:
-  algorithm: "comm_mappo"
-  hidden_dim: 256        # FIX 2: Doubled capacity so the Centralized Critic can process 24 dimensions
-  lr_actor: 3e-4
-  lr_critic: 1e-3
-  gamma: 0.99
-  k_epochs: 4
-  eps_clip: 0.1
-  entropy_coef: 0.10     # FIX 3: Massive increase to force exploration and escape the Zero-Order Trap
-  max_grad_norm: 0.2
-  comm_penalty_coef: 0.0001
-  warm_up_episodes: 1000
+  # Softens the cooperative penalty to prevent global costs from crushing local learning
+  reward_alpha: 0.1

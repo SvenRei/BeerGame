@@ -1,0 +1,12 @@
+
+algorithm: "comm_mappo"
+hidden_dim: 256
+lr_actor: 3e-4
+lr_critic: 1e-3
+gamma: 0.99
+k_epochs: 4
+eps_clip: 0.1
+entropy_coef: 0.10
+max_grad_norm: 0.2    # <--- RESTORED: Critical for training stability
+comm_penalty_coef: 0.0001
+warm_up_episodes: 1000
