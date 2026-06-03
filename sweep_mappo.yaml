@@ -1,0 +1,18 @@
+program: scripts/train_ppo.py
+method: bayes
+metric:
+  name: Avg_Cost_50
+  goal: minimize
+parameters:
+  lr_actor:
+    values: [0.001, 0.0005, 0.0001, 0.00005]
+  k_epochs:
+    values: [4, 10, 15]
+  eps_clip:
+    values: [0.1, 0.2, 0.3]
+command:
+  - ${env}
+  - python
+  - ${program}
+  - agent=mappo  # <--- Hydra override for IPPO
+  - ${args_no_hyphens}

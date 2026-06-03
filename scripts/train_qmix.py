@@ -219,10 +219,15 @@ def main(cfg: DictConfig):
                     q_val, _ = mac[a](b_o, b_h)
                     q_evals.append(q_val.gather(1, b_a))
                     
-                    # Compute maximum future Q-values from the target network
+                    # Compute maximum future Q-values using Double Q-Learning (DDQN)
                     with torch.no_grad():
+                        # 1. Use the ONLINE network to select the most promising action for the next state
+                        online_next_q, _ = mac[a](b_next_o, b_h)
+                        best_next_actions = online_next_q.argmax(dim=1, keepdim=True)
+                        
+                        # 2. Use the TARGET network to impartially evaluate the true value of that specific action
                         target_q, _ = target_mac[a](b_next_o, b_h)
-                        target_q_evals.append(target_q.max(dim=1, keepdim=True)[0])
+                        target_q_evals.append(target_q.gather(1, best_next_actions))
                 
                 # Concatenate individual Q-values into a single tensor
                 q_evals = torch.cat(q_evals, dim=1)
@@ -310,3 +315,4 @@ def main(cfg: DictConfig):
 
 # Execute script directly
 if __name__ == "__main__": main()
+

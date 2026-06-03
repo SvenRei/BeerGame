@@ -1,12 +1,29 @@
-
+# ==============================================================================
+# MAPPO / IPPO / COMM_MAPPO CONFIGURATION
+# ==============================================================================
+# Name of the algorithm. Change to "ippo" or "mappo" depending on the baseline being run.
 algorithm: "comm_mappo"
+
+# Network architecture
 hidden_dim: 256
+
+# Base Learning Rates (These will be overwritten by W&B Sweep if specified)
 lr_actor: 3e-4
 lr_critic: 1e-3
+
+# Discount factor for future rewards
 gamma: 0.99
+
+# PPO Specifics (These will be overwritten by W&B Sweep if specified)
 k_epochs: 4
 eps_clip: 0.1
 entropy_coef: 0.10
-max_grad_norm: 0.2    # <--- RESTORED: Critical for training stability
+
+# Gradient clipping to prevent exploding gradients
+max_grad_norm: 0.2
+
+# Coefficient for penalizing complex vocabulary in the communication channel
 comm_penalty_coef: 0.0001
+
+# Random actions taken at the beginning to fill the rollout buffer before early stopping evaluates
 warm_up_episodes: 1000

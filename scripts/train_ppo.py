@@ -9,11 +9,26 @@ from agents.rl.mappo import MAPPOActor, CommMAPPOActor, MAPPOCritic, MAPPOTraine
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
-    wandb.init(project="BeerGame_Research", config=dict(cfg), name=cfg.agent.algorithm)
+    # Initialize a new W&B run. Capturing the run reference is crucial for extracting dynamic run properties.
+    run = wandb.init(project="BeerGame_Research", config=dict(cfg), name=cfg.agent.algorithm)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg.env.demand_type = "poisson"
     env = BeerGameParallelEnv(cfg.env)
     algo = cfg.agent.algorithm.lower()
+    
+    # --- FIX: W&B SWEEP PARAMETER INJECTION (SYNCHRONIZED WITH MAPPO.YAML) ---
+    # We must use the exact variable names defined in your mappo.yaml file.
+    if "lr_actor" in wandb.config: cfg.agent.lr_actor = wandb.config.get("lr_actor")
+    if "lr_critic" in wandb.config: cfg.agent.lr_critic = wandb.config.get("lr_critic")
+    if "k_epochs" in wandb.config: cfg.agent.k_epochs = wandb.config.get("k_epochs")
+    if "eps_clip" in wandb.config: cfg.agent.eps_clip = wandb.config.get("eps_clip")
+    if "entropy_coef" in wandb.config: cfg.agent.entropy_coef = wandb.config.get("entropy_coef")
+    if "hidden_dim" in wandb.config: cfg.agent.hidden_dim = wandb.config.get("hidden_dim")
+    
+    # --- DYNAMIC CHECKPOINT DIRECTORY CREATION ---
+    # Isolate paths based on algorithm name, run name, and unique run token to completely avoid collisions.
+    run_dir = f"weights_{algo}/run_{run.name}_{run.id}"
+    os.makedirs(run_dir, exist_ok=True)
     
     local_dim = env.observation_space("retailer").shape[0]
     critic_in = local_dim if algo == "ippo" else local_dim * len(env.agents)
@@ -37,6 +52,7 @@ def main(cfg: DictConfig):
     best_avg_cost = float('inf')
 
     print(f"--- Starting {algo.upper()} Training Marathon ---")
+    print(f"Target Save Directory: {run_dir}")
     print(f"Warm-up Phase: {warm_up} episodes | Early Stopping active after warm-up.")
 
     for ep in range(cfg.total_episodes):
@@ -65,8 +81,7 @@ def main(cfg: DictConfig):
                         comm_val = vocab[comm_idx].view(1, 1) 
                         
                         # --- FIX B: 10% LATENT CHANNEL DROPOUT ---
-                        # Simulates packet loss. Forces the receiver to stay adaptable 
-                        # and prevents the sender from building a "Dial Tone" bridge.
+                        # Simulates packet loss. Forces the receiver to stay adaptable.
                         if torch.rand(1).item() < 0.10:
                             comm_val = torch.tensor([[0.0]], dtype=torch.float32, device=device) # Force Silence
                         
@@ -143,7 +158,19 @@ def main(cfg: DictConfig):
             best_avg_cost = avg_cost
             since_imp = 0
             if ep >= warm_up:
-                torch.save(actor.state_dict(), f"{algo}_best.pth")
+                # Target the isolated directory path instead of project root
+                checkpoint_path = f"{run_dir}/{algo}_best.pth"
+                torch.save(actor.state_dict(), checkpoint_path)
+                
+                # Generate a clean documentation manifest alongside the weights
+                with open(f"{run_dir}/description.txt", "w") as f:
+                    f.write(f"Algorithm Architecture Type: {algo.upper()}\n")
+                    f.write(f"W&B Experiment Tracking Name: {run.name}\n")
+                    f.write(f"W&B Unique Run Identifier: {run.id}\n")
+                    f.write(f"Best Observed 50-Episode Moving Average Cost: {best_avg_cost:.2f}\n")
+                    f.write("Evaluated Agent Configuration Parameters:\n")
+                    for parameter, value in dict(cfg.agent).items():
+                        f.write(f"  {parameter}: {value}\n")
         else: 
             if ep >= warm_up: 
                 since_imp += 1
