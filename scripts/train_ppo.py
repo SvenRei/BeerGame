@@ -25,9 +25,9 @@ def main(cfg: DictConfig):
     if "entropy_coef" in wandb.config: cfg.agent.entropy_coef = wandb.config.get("entropy_coef")
     if "hidden_dim" in wandb.config: cfg.agent.hidden_dim = wandb.config.get("hidden_dim")
     
-    # --- DYNAMIC CHECKPOINT DIRECTORY CREATION ---
-    # Isolate paths based on algorithm name, run name, and unique run token to completely avoid collisions.
-    run_dir = f"weights_{algo}/run_{run.name}_{run.id}"
+    # --- WINDOWS PATHING FIX: DYNAMIC CHECKPOINT DIRECTORY CREATION ---
+    # Isolate paths based on algorithm name, run name, and unique run token using os.path.join
+    run_dir = os.path.join(f"weights_{algo}", f"run_{run.name}_{run.id}")
     os.makedirs(run_dir, exist_ok=True)
     
     local_dim = env.observation_space("retailer").shape[0]
@@ -105,7 +105,7 @@ def main(cfg: DictConfig):
                 else:
                     buffer.log_probs.append(dist.log_prob(action_val).detach())
                     
-                hidden[a] = next_h
+                    hidden[a] = next_h
             
             msg = next_msg
             msg["retailer"] = torch.zeros(1, 1).to(device)
@@ -158,12 +158,13 @@ def main(cfg: DictConfig):
             best_avg_cost = avg_cost
             since_imp = 0
             if ep >= warm_up:
-                # Target the isolated directory path instead of project root
-                checkpoint_path = f"{run_dir}/{algo}_best.pth"
+                # FIX: Resolve platform checkpoint paths securely using os.path.join
+                checkpoint_path = os.path.join(run_dir, f"{algo}_best.pth")
                 torch.save(actor.state_dict(), checkpoint_path)
                 
-                # Generate a clean documentation manifest alongside the weights
-                with open(f"{run_dir}/description.txt", "w") as f:
+                # FIX: Update document generator manifest to track metrics securely on disk
+                desc_path = os.path.join(run_dir, "description.txt")
+                with open(desc_path, "w") as f:
                     f.write(f"Algorithm Architecture Type: {algo.upper()}\n")
                     f.write(f"W&B Experiment Tracking Name: {run.name}\n")
                     f.write(f"W&B Unique Run Identifier: {run.id}\n")

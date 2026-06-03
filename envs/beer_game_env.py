@@ -11,18 +11,15 @@ class BeerGameParallelEnv(ParallelEnv):
         self.agents = ["retailer", "wholesaler", "distributor", "manufacturer"]
         self.possible_agents = self.agents[:]
         
-        # Configuration parameters
         self.config = config
         self.horizon = config.get("horizon", 50)
-        self.max_order = config.get("max_order", 100) # Keep max_order at 100 for true learning
+        self.max_order = config.get("max_order", 100) 
         self.h = config.get("holding_cost", 0.5)
         self.b = config.get("backorder_cost", 1.0)
         self.lookahead = config.get("lookahead", 4)
         
-        # Actions are normalized 0.0 to 1.0
         self._action_spaces = {a: Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32) for a in self.agents}
         
-        # Obs: [Inventory, Backlog, Incoming_T1, Incoming_T2, Incoming_T3, Incoming_T4]
         obs_dim = 2 + self.lookahead
         self._observation_spaces = {a: Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32) for a in self.agents}
 
@@ -46,6 +43,7 @@ class BeerGameParallelEnv(ParallelEnv):
         self.shipment_pipelines = {a: TransitPipeline() for a in self.agents}
         
         # Steady-State Initialization (Sterman Standard)
+        # 4 units arriving in Week 1, and 4 units arriving in Week 2
         for a in self.agents:
             for t in range(1, 3):
                 self.shipment_pipelines[a].add_shipment(0, 4, t)
@@ -66,47 +64,22 @@ class BeerGameParallelEnv(ParallelEnv):
         return np.array(obs, dtype=np.float32)
 
     def step(self, actions):
+        # FIX: Advance time FIRST so the physical week aligns with the steady-state pipeline
+        self.current_step += 1
+        
         rewards, terminations, truncations, infos = {}, {}, {}, {}
         total_system_cost = 0.0
-        orders = {}
 
-        # 1. Place Orders (Information Flow Upstream)
+        # --- PHASE 1: RECEIVE INCOMING GOODS ---
         for agent in self.agents:
-            raw_action = float(np.clip(actions[agent][0], 0.0, 1.0))
-            
-            # --- FIX: Linear Action Mapping ---
-            target_base_stock = raw_action * self.max_order
-            
-            # Compute total items currently in transit (pipeline inventory)
-            in_transit = sum(
-                qty for step, qty in self.shipment_pipelines[agent].pipeline.items() 
-                if step > self.current_step
-            )
-            
-            # Calculate True Inventory Position
-            inventory_position = self.inventory[agent] + in_transit - self.backlog[agent]
-            
-            # The order quantity is the replenishment needed to hit the target
-            calculated_order = max(0, int(np.round(target_base_stock - inventory_position)))
-            orders[agent] = calculated_order
-            
-            # The Manufacturer Production Loop
-            if agent == "manufacturer":
-                self.shipment_pipelines[agent].add_shipment(self.current_step, orders[agent], lead_time=2)
-            else:
-                self.order_pipelines[agent].add_shipment(self.current_step, orders[agent], lead_time=2)
-
-        # 2. Process Material Flow Downstream
-        demand_type = self.config.get("demand_type", "step")
-        
-        for i, agent in enumerate(self.agents):
-            # Receive incoming beer
             self.inventory[agent] += self.shipment_pipelines[agent].receive_shipment(self.current_step)
-            
-            # Determine Demand
+
+        # --- PHASE 2: DETERMINE & FULFILL DEMAND ---
+        demand_type = self.config.get("demand_type", "step")
+        for i, agent in enumerate(self.agents):
             if agent == "retailer":
                 if demand_type == "step":
-                    current_demand = 4 if self.current_step < 4 else 8
+                    current_demand = 4 if self.current_step <= 4 else 8
                 elif demand_type == "black_swan":
                     base_demand = 8 if self.current_step < 25 else 20
                     current_demand = np.random.poisson(base_demand)
@@ -116,38 +89,59 @@ class BeerGameParallelEnv(ParallelEnv):
                     elif self.current_step < 30: base_demand = 0   
                     else: base_demand = np.random.randint(5, 25)
                     current_demand = np.random.poisson(base_demand) if base_demand > 0 else 0
+                elif demand_type == "zero": # For testing isolation
+                    current_demand = 0
                 else:
                     current_demand = np.random.poisson(8)
             else:
+                # Upstream agents receive demand from the downstream agent's order pipeline
                 current_demand = self.order_pipelines[self.agents[i - 1]].receive_shipment(self.current_step)
             
-            # Fulfill Demand
+            # Fulfill what is physically possible
             total_req = current_demand + self.backlog[agent]
             fulfilled = min(self.inventory[agent], total_req)
             self.inventory[agent] -= fulfilled
             self.backlog[agent] = total_req - fulfilled
 
-            # Ship to Downstream (if not retailer)
+            # Ship to downstream
             if agent != "retailer":
                 delay = np.random.randint(1, 10) if self.config.get("jittery_lead_time", False) else 2 
                 self.shipment_pipelines[self.agents[i - 1]].add_shipment(self.current_step, fulfilled, delay)
 
-            # Calculate Operational Costs
+        # --- PHASE 3: PLACE ORDERS (Base-Stock Math) ---
+        orders = {}
+        for agent in self.agents:
+            raw_action = float(np.clip(actions[agent][0], 0.0, 1.0))
+            target_base_stock = raw_action * self.max_order
+            
+            # FIX: True Inventory Position must include ALL pending items (Shipments + Upstream Orders)
+            in_transit_shipments = sum(qty for step, qty in self.shipment_pipelines[agent].pipeline.items() if step > self.current_step)
+            in_transit_orders = 0
+            if agent != "manufacturer":
+                in_transit_orders = sum(qty for step, qty in self.order_pipelines[agent].pipeline.items() if step > self.current_step)
+            
+            inventory_position = self.inventory[agent] + in_transit_shipments + in_transit_orders - self.backlog[agent]
+            calculated_order = max(0, int(np.round(target_base_stock - inventory_position)))
+            orders[agent] = calculated_order
+            
+            if agent == "manufacturer":
+                self.shipment_pipelines[agent].add_shipment(self.current_step, orders[agent], lead_time=2)
+            else:
+                self.order_pipelines[agent].add_shipment(self.current_step, orders[agent], lead_time=2)
+
+        # --- PHASE 4: ACCOUNTING & REWARDS ---
+        done = self.current_step >= self.horizon
+        alpha = self.config.get("reward_alpha", 0.5)
+        
+        for agent in self.agents:
             agent_cost = (self.h * self.inventory[agent]) + (self.b * self.backlog[agent])
             total_system_cost += agent_cost
             infos[agent] = {"local_cost": agent_cost}
 
-        self.current_step += 1
-        done = self.current_step >= self.horizon
-        
-        # --- FIX: Mixed Reward Shaping ---
-        # alpha = 0.5 mathematically blends immediate local survival with global cooperation
-        alpha = self.config.get("reward_alpha", 0.5)
-        for a in self.agents:
-            local_penalty = infos[a]["local_cost"]
-            # The agent is punished for its own mistakes, PLUS a weighted penalty for the team's mistakes
-            rewards[a] = -local_penalty - (alpha * total_system_cost)
-            terminations[a] = done
-            truncations[a] = False
+        for agent in self.agents:
+            local_penalty = infos[agent]["local_cost"]
+            rewards[agent] = -local_penalty - (alpha * total_system_cost)
+            terminations[agent] = done
+            truncations[agent] = False
 
         return {a: self._build_obs(a) for a in self.agents}, rewards, terminations, truncations, infos

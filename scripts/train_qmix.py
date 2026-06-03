@@ -60,7 +60,7 @@ class ReplayBuffer:
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
     # Initialize a new W&B run to track the QMIX baseline performance
-    wandb.init(project="BeerGame_Research", config=dict(cfg), name="qmix_baseline")
+    run = wandb.init(project="BeerGame_Research", config=dict(cfg), name="qmix_baseline")
     # Automatically select the GPU if available, otherwise fall back to CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -68,6 +68,11 @@ def main(cfg: DictConfig):
     cfg.env.demand_type = "poisson"
     # Instantiate the Beer Game simulator with the config parameters
     env = BeerGameParallelEnv(cfg.env)
+    
+    # --- WINDOWS PATHING FIX: DYNAMIC DIR LOGIC INTEGRATION ---
+    # Isolate path structures safely using cross-platform safe path builders
+    run_dir = os.path.join("weights_qmix", f"run_{run.name}_{run.id}")
+    os.makedirs(run_dir, exist_ok=True)
     
     # Extract the observation vector size (local state) from the Retailer
     local_dim = env.observation_space("retailer").shape[0]
@@ -124,6 +129,7 @@ def main(cfg: DictConfig):
 
     # Print initialization confirmation to the terminal
     print(f"--- Starting QMIX Baseline Training Marathon ---")
+    print(f"Target Save Directory: {run_dir}")
     print(f"Discretization: {n_actions} bins | Buffer Size: {cfg.agent.buffer_size}")
     print(f"Warm-up: {warm_up} | Epsilon Decay: {eps_decay_eps} | Patience: {patience}")
     print(f"NOTE: Early stopping is strictly locked until episode {max(warm_up, eps_decay_eps)}.")
@@ -293,7 +299,15 @@ def main(cfg: DictConfig):
             # Only save weights if we are out of the purely random warm-up phase
             if ep >= warm_up:
                 for a in env.agents:
-                    torch.save(mac[a].state_dict(), f"qmix_agent_{a}_best.pth")
+                    # FIX: Safely route tensors through standardized cross-platform paths
+                    save_path = os.path.join(run_dir, f"qmix_agent_{a}_best.pth")
+                    torch.save(mac[a].state_dict(), save_path)
+                
+                # Generate a clean documentation manifest alongside the weights
+                desc_path = os.path.join(run_dir, "description.txt")
+                with open(desc_path, "w") as f:
+                    f.write(f"W&B Run Name: {run.name}\n")
+                    f.write(f"Best Avg Cost: {best_avg_cost:.2f}\n")
         else:
             if ep >= warm_up:
                 since_imp += 1
@@ -315,4 +329,3 @@ def main(cfg: DictConfig):
 
 # Execute script directly
 if __name__ == "__main__": main()
-

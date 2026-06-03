@@ -1,0 +1,15 @@
+algorithm: "comm_qmix"
+hidden_dim: 256
+n_actions: 51
+mixing_embed_dim: 256
+hypernet_embed: 64
+lr: 1e-3
+gamma: 0.99
+target_update_freq: 200
+buffer_size: 5000
+batch_size: 32
+epsilon_start: 1.0
+epsilon_end: 0.05
+epsilon_decay_episodes: 5000  # <--- FIXED: Added "_episodes" to the key
+comm_penalty_coef: 0.0001
+warm_up_episodes: 1000
