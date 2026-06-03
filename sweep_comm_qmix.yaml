@@ -11,8 +11,7 @@ parameters:
   batch_size:
     values: [32, 64, 128]
 command:
-  - ${env}
-  - python
+  - venv/Scripts/python.exe  # <--- THE OS FIX: Hardcode the venv Python path
   - ${program}
-  - agent=qmix
-  - ${args_no_hyphens}
+  - agent=comm_qmix               # <--- Keep your agent architecture override
+  - ${args_no_hyphens}       # <--- W&B automatically injects the sweep parameters here

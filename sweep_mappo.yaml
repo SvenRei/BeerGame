@@ -11,8 +11,7 @@ parameters:
   eps_clip:
     values: [0.1, 0.2, 0.3]
 command:
-  - ${env}
-  - python
+  - venv/Scripts/python.exe  # <--- THE OS FIX: Hardcode the venv Python path
   - ${program}
-  - agent=mappo  # <--- Hydra override for IPPO
-  - ${args_no_hyphens}
+  - agent=mappo               # <--- Keep your agent architecture override
+  - ${args_no_hyphens}       # <--- W&B automatically injects the sweep parameters here

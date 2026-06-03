@@ -1,18 +1,22 @@
 program: scripts/train_ppo.py
 method: bayes
 metric:
-  name: Avg_Cost_50
   goal: minimize
+  name: Avg_Cost_50
 parameters:
-  lr_actor:
-    values: [0.001, 0.0005, 0.0001, 0.00005]
-  k_epochs:
+  agent.lr_actor:
+    values: [0.00005, 0.0001, 0.0003, 0.001]
+  agent.lr_critic:
+    values: [0.0001, 0.0005, 0.001, 0.003]
+  agent.k_epochs:
     values: [4, 10, 15]
-  eps_clip:
+  agent.eps_clip:
     values: [0.1, 0.2, 0.3]
+  agent.entropy_coef:
+    values: [0.01, 0.05, 0.1]
+
 command:
-  - ${env}
-  - python
+  - venv/Scripts/python.exe
   - ${program}
-  - agent=ippo  # <--- Hydra override for IPPO
+  - agent=ippo
   - ${args_no_hyphens}
