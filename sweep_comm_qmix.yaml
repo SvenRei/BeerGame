@@ -4,14 +4,20 @@ metric:
   name: Avg_Cost_50
   goal: minimize
 parameters:
-  lr:
+  agent.lr:
     values: [0.001, 0.0005, 0.0001, 0.00005]
-  target_update_freq:
+  agent.target_update_freq:
     values: [100, 200, 500, 1000]
-  batch_size:
-    values: [32, 64, 128]
+  # UPGRADE 1: Expanded Batch Size Net
+  agent.batch_size:
+    values: [64, 128, 256, 512]
+  # UPGRADE 2: Discretization Resolution Search
+  agent.n_actions:
+    values: [11, 21, 51, 101]
+  agent.comm_penalty_coef:
+    values: [0.0, 0.0001, 0.0005, 0.001]
 command:
-  - venv/Scripts/python.exe  # <--- THE OS FIX: Hardcode the venv Python path
+  - venv/Scripts/python.exe
   - ${program}
-  - agent=comm_qmix               # <--- Keep your agent architecture override
-  - ${args_no_hyphens}       # <--- W&B automatically injects the sweep parameters here
+  - agent=comm_qmix
+  - ${args_no_hyphens}

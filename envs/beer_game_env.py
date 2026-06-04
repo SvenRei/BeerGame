@@ -20,8 +20,8 @@ class BeerGameParallelEnv(ParallelEnv):
         
         self._action_spaces = {a: Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32) for a in self.agents}
         
-        obs_dim = 2 + self.lookahead
-        self._observation_spaces = {a: Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32) for a in self.agents}
+        obs_dim = 3 + self.lookahead
+        self._observation_spaces = {a: Box(low=-2000.0, high=2000.0, shape=(obs_dim,), dtype=np.float32) for a in self.agents}
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent): 
@@ -39,11 +39,13 @@ class BeerGameParallelEnv(ParallelEnv):
         self.inventory = {a: 12 for a in self.agents}
         self.backlog = {a: 0 for a in self.agents}
         
+        # FIX (Test 18): Strict POMDP Ledger Initialization
+        # 4 units ordered at t=-1, 4 units ordered at t=-2 (Steady State)
+        self.unfulfilled_orders = {a: 8 for a in self.agents}
+        
         self.order_pipelines = {a: TransitPipeline() for a in self.agents}
         self.shipment_pipelines = {a: TransitPipeline() for a in self.agents}
         
-        # Steady-State Initialization (Sterman Standard)
-        # 4 units arriving in Week 1, and 4 units arriving in Week 2
         for a in self.agents:
             for t in range(1, 3):
                 self.shipment_pipelines[a].add_shipment(0, 4, t)
@@ -58,13 +60,16 @@ class BeerGameParallelEnv(ParallelEnv):
         return np.array(global_state, dtype=np.float32)
 
     def _build_obs(self, agent):
-        obs = [float(self.inventory[agent]), float(self.backlog[agent])]
+        # FIX (Test 18): Pure local observation. No telepathic lookup of supplier backlogs.
+        obs = [float(self.inventory[agent]), float(self.backlog[agent]), float(self.unfulfilled_orders[agent])]
+        
         for t in range(1, self.lookahead + 1):
             obs.append(float(self.shipment_pipelines[agent].pipeline.get(self.current_step + t, 0)))
-        return np.array(obs, dtype=np.float32)
+            
+        obs_array = np.array(obs, dtype=np.float32)
+        return np.clip(obs_array, -2000.0, 2000.0)
 
     def step(self, actions):
-        # FIX: Advance time FIRST so the physical week aligns with the steady-state pipeline
         self.current_step += 1
         
         rewards, terminations, truncations, infos = {}, {}, {}, {}
@@ -72,14 +77,18 @@ class BeerGameParallelEnv(ParallelEnv):
 
         # --- PHASE 1: RECEIVE INCOMING GOODS ---
         for agent in self.agents:
-            self.inventory[agent] += self.shipment_pipelines[agent].receive_shipment(self.current_step)
+            received = self.shipment_pipelines[agent].receive_shipment(self.current_step)
+            self.inventory[agent] += received
+            # FIX (Test 18): Deduct received goods from the POMDP ledger
+            self.unfulfilled_orders[agent] -= received
 
         # --- PHASE 2: DETERMINE & FULFILL DEMAND ---
         demand_type = self.config.get("demand_type", "step")
         for i, agent in enumerate(self.agents):
             if agent == "retailer":
                 if demand_type == "step":
-                    current_demand = 4 if self.current_step <= 4 else 8
+                    # FIX (Test 20): Shift shock to t>5 to allow baseline verification
+                    current_demand = 4 if self.current_step <= 5 else 8
                 elif demand_type == "black_swan":
                     base_demand = 8 if self.current_step < 25 else 20
                     current_demand = np.random.poisson(base_demand)
@@ -89,40 +98,31 @@ class BeerGameParallelEnv(ParallelEnv):
                     elif self.current_step < 30: base_demand = 0   
                     else: base_demand = np.random.randint(5, 25)
                     current_demand = np.random.poisson(base_demand) if base_demand > 0 else 0
-                elif demand_type == "zero": # For testing isolation
+                elif demand_type == "zero":
                     current_demand = 0
                 else:
                     current_demand = np.random.poisson(8)
             else:
-                # Upstream agents receive demand from the downstream agent's order pipeline
                 current_demand = self.order_pipelines[self.agents[i - 1]].receive_shipment(self.current_step)
             
-            # Fulfill what is physically possible
             total_req = current_demand + self.backlog[agent]
             fulfilled = min(self.inventory[agent], total_req)
             self.inventory[agent] -= fulfilled
             self.backlog[agent] = total_req - fulfilled
 
-            # Ship to downstream
             if agent != "retailer":
                 delay = np.random.randint(1, 10) if self.config.get("jittery_lead_time", False) else 2 
                 self.shipment_pipelines[self.agents[i - 1]].add_shipment(self.current_step, fulfilled, delay)
 
-        # --- PHASE 3: PLACE ORDERS (Base-Stock Math) ---
+        # --- PHASE 3: PLACE ORDERS (Direct Action Control) ---
         orders = {}
         for agent in self.agents:
             raw_action = float(np.clip(actions[agent][0], 0.0, 1.0))
-            target_base_stock = raw_action * self.max_order
-            
-            # FIX: True Inventory Position must include ALL pending items (Shipments + Upstream Orders)
-            in_transit_shipments = sum(qty for step, qty in self.shipment_pipelines[agent].pipeline.items() if step > self.current_step)
-            in_transit_orders = 0
-            if agent != "manufacturer":
-                in_transit_orders = sum(qty for step, qty in self.order_pipelines[agent].pipeline.items() if step > self.current_step)
-            
-            inventory_position = self.inventory[agent] + in_transit_shipments + in_transit_orders - self.backlog[agent]
-            calculated_order = max(0, int(np.round(target_base_stock - inventory_position)))
+            calculated_order = int(np.round(raw_action * self.max_order))
             orders[agent] = calculated_order
+            
+            # FIX (Test 18): Add new orders to the POMDP ledger
+            self.unfulfilled_orders[agent] += calculated_order
             
             if agent == "manufacturer":
                 self.shipment_pipelines[agent].add_shipment(self.current_step, orders[agent], lead_time=2)
@@ -140,8 +140,9 @@ class BeerGameParallelEnv(ParallelEnv):
 
         for agent in self.agents:
             local_penalty = infos[agent]["local_cost"]
-            rewards[agent] = -local_penalty - (alpha * total_system_cost)
-            terminations[agent] = done
-            truncations[agent] = False
+            rewards[agent] = -((1.0 - alpha) * local_penalty) - (alpha * total_system_cost)
+            
+            terminations[agent] = False
+            truncations[agent] = done
 
         return {a: self._build_obs(a) for a in self.agents}, rewards, terminations, truncations, infos
