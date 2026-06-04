@@ -188,8 +188,9 @@ def main(cfg: DictConfig):
             global_reward = -sum(infos[a]["local_cost"] for a in env.agents) / 100.0
             # Build the next step's global state array
             next_state = np.concatenate([next_obs[a] for a in sorted_agents])
-            # Check for terminal state flag
-            done = any(terms.values())
+            
+            # --- THE FIX: CATCH BOTH TERMINATIONS AND TRUNCATIONS ---
+            done = any(terms.values()) or any(truncs.values())
             
             # Store the full transition inside the memory buffer
             buffer.push(state, obs, acts, global_reward, next_state, next_obs, done)

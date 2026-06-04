@@ -7,13 +7,14 @@ from collections import deque
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
-from agents.rl.qmix import CommQMixLocalAgent, QMixer
+from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer
 
+# ENGINEER FIX: ReplayBuffer now stores the hidden state to preserve GRU memory
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
-    def push(self, state, obs, acts, reward, next_state, next_obs, done):
-        self.buffer.append((state, obs, acts, reward, next_state, next_obs, done))
+    def push(self, state, obs, acts, reward, next_state, next_obs, done, hidden):
+        self.buffer.append((state, obs, acts, reward, next_state, next_obs, done, hidden))
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
     def __len__(self):
@@ -21,18 +22,16 @@ class ReplayBuffer:
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
-    # Initialize W&B tracking
     run = wandb.init(project="BeerGame_Research", config=dict(cfg), name="comm_qmix")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg.env.demand_type = "poisson"
     env = BeerGameParallelEnv(cfg.env)
     
-    # --- W&B SWEEP PARAMETER INJECTION ---
     cfg.agent.lr = wandb.config.get("lr", cfg.agent.lr)
     cfg.agent.target_update_freq = wandb.config.get("target_update_freq", cfg.agent.target_update_freq)
     cfg.agent.batch_size = wandb.config.get("batch_size", cfg.agent.batch_size)
+    vocab_size = wandb.config.get("vocab_size", cfg.agent.get("vocab_size", 3))
     
-    # --- DYNAMIC CHECKPOINT DIRECTORY CREATION ---
     run_dir = f"weights_comm_qmix/run_{run.name}_{run.id}"
     os.makedirs(run_dir, exist_ok=True)
     
@@ -41,89 +40,78 @@ def main(cfg: DictConfig):
     n_actions = cfg.agent.n_actions 
     hidden_dim = cfg.agent.hidden_dim
     
-    # CRITICAL: Define the hardcoded downstream sequential order required for DIAL
-    comm_order = ["retailer", "wholesaler", "distributor", "manufacturer"]
-    
-    # 1. Initialize Online Networks using the new CommQMixLocalAgent
-    mac = {a: CommQMixLocalAgent(local_dim, hidden_dim, n_actions).to(device) for a in env.agents}
+    base_agent = CommQMixLocalAgent(local_dim, hidden_dim, n_actions, vocab_size=vocab_size)
+    mac = QMixCommMAC(base_agent, num_agents=len(env.agents)).to(device)
     mixer = QMixer(len(env.agents), state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
     
-    # 2. Initialize Target Networks
-    target_mac = {a: CommQMixLocalAgent(local_dim, hidden_dim, n_actions).to(device) for a in env.agents}
+    target_base = CommQMixLocalAgent(local_dim, hidden_dim, n_actions, vocab_size=vocab_size)
+    target_mac = QMixCommMAC(target_base, num_agents=len(env.agents)).to(device)
     target_mixer = QMixer(len(env.agents), state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
     
-    for a in env.agents: target_mac[a].load_state_dict(mac[a].state_dict())
+    target_mac.load_state_dict(mac.state_dict())
     target_mixer.load_state_dict(mixer.state_dict())
     
-    # 3. Setup Optimizer and Memory
-    all_params = list(mixer.parameters())
-    for a in env.agents: all_params += list(mac[a].parameters())
+    all_params = list(mixer.parameters()) + list(mac.parameters())
     optimizer = optim.Adam(all_params, lr=cfg.agent.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
     
     buffer = ReplayBuffer(cfg.agent.buffer_size)
     
-    patience = cfg.agent.get("patience", 2000)
-    since_imp = 0
+    patience, since_imp = cfg.agent.get("patience", 2000), 0
     warm_up = cfg.agent.get("warm_up_episodes", 1000)
     eps_decay_eps = cfg.agent.get("epsilon_decay_episodes", 5000)
-    
     cost_history = deque(maxlen=50)
-    best_avg_cost = float('inf')
-    global_step = 0
-    epsilon = cfg.agent.epsilon_start
+    best_avg_cost, global_step, epsilon = float('inf'), 0, cfg.agent.epsilon_start
 
-    print(f"--- Starting COMM_QMIX Baseline Training Marathon ---")
-    print(f"Target Save Directory: {run_dir}")
+    print(f"--- Starting COMM_QMIX Training Marathon ---")
 
     for ep in range(cfg.total_episodes):
+        # ENGINEER FIX: Calculate dynamic tau
+        tau = max(0.05, 5.0 * (1.0 - ep / cfg.total_episodes))
+        
         obs, _ = env.reset(seed=1000 + ep)
-        hidden = {a: torch.zeros(1, hidden_dim).to(device) for a in env.agents}
+        mac.init_buffer(batch_size=1, device=device)
+        hiddens_tensor = torch.zeros(1, len(env.agents), hidden_dim).to(device)
+        
         ep_cost = 0.0
+        episode_messages = []
         
         while True:
+            obs_array = np.stack([obs[a] for a in env.agents])
+            obs_tensor = torch.tensor(obs_array, dtype=torch.float32).unsqueeze(0).to(device)
+            state = np.concatenate([obs[a] for a in sorted(env.agents)])
+            
+            with torch.no_grad():
+                # ENGINEER FIX: Pass tau
+                q_vals, next_hiddens, safe_logs = mac(obs_tensor, hiddens_tensor, tau=tau)
+                episode_messages.append(safe_logs)
+                
             acts, env_acts = {}, {}
-            sorted_agents = sorted(env.agents)
-            state = np.concatenate([obs[a] for a in sorted_agents])
+            actions_list = []
             
-            # Initialize the physical execution message chain. Retailer starts with Silence (0.0).
-            current_msg = torch.zeros(1, 1).to(device)
-            
-            # --- ACTION & MESSAGE SELECTION (Sequential Downstream) ---
-            for i, a in enumerate(comm_order):
-                o_t = torch.tensor(obs[a], dtype=torch.float32).unsqueeze(0).to(device)
-                
-                with torch.no_grad():
-                    # Pass the current observation and the incoming message into the network
-                    q_vals, msg_out, next_h = mac[a](o_t, current_msg, hidden[a])
-                
+            for i, a in enumerate(env.agents):
                 if random.random() < epsilon:
                     action_idx = random.randint(0, n_actions - 1)
                 else:
-                    action_idx = q_vals.argmax(dim=1).item()
+                    action_idx = q_vals[0, i].argmax(dim=-1).item()
                 
                 acts[a] = action_idx
-                hidden[a] = next_h.squeeze(1)
+                actions_list.append(action_idx)
                 env_acts[a] = [action_idx / (n_actions - 1)]
                 
-                # --- APPLY LATENT CHANNEL DROPOUT ---
-                if i < len(comm_order) - 1:
-                    if torch.rand(1).item() < 0.10:
-                        current_msg = torch.zeros(1, 1).to(device) # Network disconnect
-                    else:
-                        current_msg = msg_out # Hand off generated message to next agent
-            
             next_obs, rewards, terms, truncs, infos = env.step(env_acts)
             ep_cost += sum(infos[a]["local_cost"] for a in env.agents)
             global_reward = -sum(infos[a]["local_cost"] for a in env.agents) / 100.0
-            next_state = np.concatenate([next_obs[a] for a in sorted_agents])
-            done = any(terms.values())
+            next_state = np.concatenate([next_obs[a] for a in sorted(env.agents)])
+            next_obs_array = np.stack([next_obs[a] for a in env.agents])
             
-            # We do NOT save the messages in the buffer. DIAL mathematically reconstructs 
-            # them during the training pass to maintain the unbroken PyTorch gradient graph.
-            buffer.push(state, obs, acts, global_reward, next_state, next_obs, done)
+            done = any(terms.values()) or any(truncs.values())
+            
+            # Pushed to buffer with hidden state
+            buffer.push(state, obs_array, actions_list, global_reward, next_state, next_obs_array, done, hiddens_tensor.detach().cpu().numpy())
             
             obs = next_obs
+            hiddens_tensor = next_hiddens
             global_step += 1
             
             # --- TRAINING STEP ---
@@ -131,52 +119,32 @@ def main(cfg: DictConfig):
                 batch = buffer.sample(cfg.agent.batch_size)
                 
                 b_states = torch.tensor(np.array([b[0] for b in batch]), dtype=torch.float32).to(device)
+                b_obs = torch.tensor(np.array([b[1] for b in batch]), dtype=torch.float32).to(device)
+                b_actions = torch.tensor(np.array([b[2] for b in batch]), dtype=torch.long).unsqueeze(-1).to(device)
                 b_rewards = torch.tensor(np.array([b[3] for b in batch]), dtype=torch.float32).unsqueeze(1).to(device)
                 b_next_states = torch.tensor(np.array([b[4] for b in batch]), dtype=torch.float32).to(device)
+                b_next_obs = torch.tensor(np.array([b[5] for b in batch]), dtype=torch.float32).to(device)
                 b_dones = torch.tensor(np.array([b[6] for b in batch]), dtype=torch.float32).unsqueeze(1).to(device)
+                # ENGINEER FIX: Extract stored hidden state
+                b_h = torch.tensor(np.array([b[7] for b in batch]), dtype=torch.float32).to(device)
                 
-                # Use dictionaries to prevent Matrix misalignment when concatenating for the Mixer
-                q_evals_dict, target_q_evals_dict = {}, {}
+                mac.init_buffer(cfg.agent.batch_size, device)
+                target_mac.init_buffer(cfg.agent.batch_size, device)
                 
-                # Initialize silence for the Retailer at the start of the batch training graph
-                b_msg_online = torch.zeros(cfg.agent.batch_size, 1).to(device)
-                b_msg_target = torch.zeros(cfg.agent.batch_size, 1).to(device)
+                # Pass tau and b_h
+                q_evals, _, _ = mac(b_obs, b_h, tau=tau)
+                chosen_q_evals = torch.gather(q_evals, dim=2, index=b_actions)
                 
-                # CRITICAL DIAL STEP: Process agents in downstream order to weave the gradients together
-                for a in comm_order:
-                    b_o = torch.tensor(np.array([b[1][a] for b in batch]), dtype=torch.float32).to(device)
-                    b_next_o = torch.tensor(np.array([b[5][a] for b in batch]), dtype=torch.float32).to(device)
-                    b_a = torch.tensor(np.array([b[2][a] for b in batch]), dtype=torch.long).unsqueeze(1).to(device)
-                    b_h = torch.zeros(cfg.agent.batch_size, hidden_dim).to(device)
+                with torch.no_grad():
+                    online_next_q, _, _ = mac(b_next_obs, b_h, tau=tau)
+                    best_next_actions = online_next_q.argmax(dim=2, keepdim=True)
+                    target_q, _, _ = target_mac(b_next_obs, b_h, tau=tau)
+                    target_q_evals = torch.gather(target_q, dim=2, index=best_next_actions)
                     
-                    # 1. ONLINE NETWORK (Gradient Chain)
-                    q_val, next_msg_online, _ = mac[a](b_o, b_msg_online, b_h)
-                    q_evals_dict[a] = q_val.gather(1, b_a)
-                    
-                    # 2. TARGET NETWORK (Detached Evaluation)
-                    with torch.no_grad():
-                        # Use detached online message to select action (DDQN)
-                        online_next_q, _, _ = mac[a](b_next_o, b_msg_online.detach(), b_h)
-                        best_next_actions = online_next_q.argmax(dim=1, keepdim=True)
-                        
-                        target_q, next_msg_target, _ = target_mac[a](b_next_o, b_msg_target, b_h)
-                        target_q_evals_dict[a] = target_q.gather(1, best_next_actions)
-                    
-                    # 3. MESSAGE HANDOFF WITH DROPOUT
-                    # Apply identical 10% dropout to the training graph to make the policies robust
-                    dropout_mask = (torch.rand(cfg.agent.batch_size, 1).to(device) >= 0.10).float()
-                    b_msg_online = next_msg_online * dropout_mask
-                    b_msg_target = next_msg_target * dropout_mask
-                
-                # RE-ALIGNMENT: Concatenate Q-values strictly in alphabetical order 
-                # (distributor, manufacturer, retailer, wholesaler) to perfectly match the Mixer's state vector.
-                q_evals = torch.cat([q_evals_dict[a] for a in sorted_agents], dim=1)
-                target_q_evals = torch.cat([target_q_evals_dict[a] for a in sorted_agents], dim=1)
-                
-                q_tot = mixer(q_evals, b_states)
+                q_tot = mixer(chosen_q_evals, b_states)
                 with torch.no_grad():
                     target_q_tot = target_mixer(target_q_evals, b_next_states)
-                
+                    
                 targets = b_rewards + cfg.agent.gamma * (1 - b_dones) * target_q_tot.squeeze(2)
                 loss = nn.MSELoss()(q_tot.squeeze(2), targets.detach())
                 
@@ -186,7 +154,7 @@ def main(cfg: DictConfig):
                 optimizer.step()
                 
             if global_step % cfg.agent.target_update_freq == 0:
-                for a in env.agents: target_mac[a].load_state_dict(mac[a].state_dict())
+                target_mac.load_state_dict(mac.state_dict())
                 target_mixer.load_state_dict(mixer.state_dict())
                 
             if done: break
@@ -197,34 +165,23 @@ def main(cfg: DictConfig):
         cost_history.append(ep_cost)
         avg_cost = sum(cost_history) / len(cost_history)
         
-        wandb.log({
-            "Cost": ep_cost, "Avg_Cost_50": avg_cost, 
-            "Epsilon": epsilon, "LR": scheduler.get_last_lr()[0]
-        })
+        wandb.log({"Cost": ep_cost, "Avg_Cost_50": avg_cost, "Epsilon": epsilon, "Tau": tau, "LR": scheduler.get_last_lr()[0]})
         
-        if ep == warm_up:
-            best_avg_cost = float('inf')
-            since_imp = 0
+        if ep == warm_up: best_avg_cost, since_imp = float('inf'), 0
             
         if avg_cost < best_avg_cost and len(cost_history) == 50: 
             best_avg_cost = avg_cost
             since_imp = 0
             if ep >= warm_up:
-                for a in env.agents:
-                    torch.save(mac[a].state_dict(), f"{run_dir}/comm_qmix_agent_{a}_best.pth")
-                with open(f"{run_dir}/description.txt", "w") as f:
-                    f.write(f"W&B Run Name: {run.name}\n")
-                    f.write(f"Best Avg Cost: {best_avg_cost}\n")
+                torch.save(mac.state_dict(), f"{run_dir}/comm_qmix_mac_best.pth")
+                np.save(f"{run_dir}/best_messages_ep_{ep}.npy", np.concatenate(episode_messages, axis=0))
         else:
             if ep >= warm_up: since_imp += 1
                 
         exploration_lock = max(warm_up, eps_decay_eps)
-        if ep > exploration_lock and since_imp >= patience:
-            break
-                
+        if ep > exploration_lock and since_imp >= patience: break
         if ep % 10 == 0: 
-            best_display = best_avg_cost if best_avg_cost != float('inf') else 0.0
-            print(f"Ep {ep} | Cost: {ep_cost:.2f} | 50-Ep Avg: {avg_cost:.2f} | Best Avg: {best_display:.2f} | Eps: {epsilon:.2f}")
+            print(f"Ep {ep} | Cost: {ep_cost:.2f} | 50-Ep Avg: {avg_cost:.2f} | Best: {best_avg_cost if best_avg_cost != float('inf') else 0.0:.2f} | Eps: {epsilon:.2f} | Tau: {tau:.2f}")
             
     wandb.finish()
 

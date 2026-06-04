@@ -2,20 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ==============================================================================
-# 1. THE LOCAL AGENT NETWORK (Vanilla QMIX)
-# ==============================================================================
 class QMixLocalAgent(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_actions):
         super(QMixLocalAgent, self).__init__()
         self.hidden_dim = hidden_dim
-        
-        # Feature Extraction
         self.fc1 = nn.Linear(input_dim, hidden_dim)
-        # Recurrent Memory (GRU)
         self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
-        
-        # Dueling Streams
         self.value_stream = nn.Linear(hidden_dim, 1)
         self.advantage_stream = nn.Linear(hidden_dim, n_actions)
 
@@ -23,91 +15,130 @@ class QMixLocalAgent(nn.Module):
         x = F.relu(self.fc1(obs))
         h_in = hidden.reshape(-1, self.hidden_dim)
         h = self.rnn(x, h_in)
-        
         V = self.value_stream(h)
         A = self.advantage_stream(h)
-        # Dueling aggregation
         q_vals = V + A - A.mean(dim=1, keepdim=True)
-        
         return q_vals, h
 
-
-# ==============================================================================
-# 2. THE COMMUNICATIVE AGENT NETWORK (DIAL QMIX)
-# ==============================================================================
 class CommQMixLocalAgent(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_actions):
+    def __init__(self, input_dim, hidden_dim, n_actions, vocab_size=3, **kwargs):
         super(CommQMixLocalAgent, self).__init__()
         self.hidden_dim = hidden_dim
+        self.vocab_size = vocab_size
         
-        # Feature extraction now takes the Observation + 1 Incoming Message
-        self.fc1 = nn.Linear(input_dim + 1, hidden_dim)
+        # ENGINEER FIX: Dual-Stream Architecture
+        # Observations and Messages are encoded separately to prevent feature collision
+        stream_dim = hidden_dim // 2
+        self.obs_encoder = nn.Linear(input_dim, stream_dim)
+        self.msg_encoder = nn.Linear(1, stream_dim)
+        
+        # The GRU now takes the fused representation
         self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
-        
-        # Dueling physical action streams
         self.value_stream = nn.Linear(hidden_dim, 1)
         self.advantage_stream = nn.Linear(hidden_dim, n_actions)
-        
-        # DIAL Message Generator: Outputs logits for 3 discrete tokens (-1, 0, 1)
-        self.msg_stream = nn.Linear(hidden_dim, 3)
+        self.msg_stream = nn.Linear(hidden_dim, vocab_size)
 
-    def forward(self, obs, msg_in, hidden):
-        # 1. Fuse the local physical observation with the latent signal from upstream
-        x = torch.cat([obs, msg_in], dim=-1)
-        x = F.relu(self.fc1(x))
+    def get_vocab_tensor(self, device):
+        if self.vocab_size == 1: return torch.tensor([0.0], device=device)
+        elif self.vocab_size == 3: return torch.tensor([-1.0, 0.0, 1.0], device=device)
+        elif self.vocab_size == 5: return torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=device)
+        else: raise ValueError("Vocab size must be 1, 3, or 5")
+
+    def forward(self, obs, msg_in, hidden, tau=1.0):
+        # Process streams separately
+        obs_feat = F.relu(self.obs_encoder(obs))
+        msg_feat = F.relu(self.msg_encoder(msg_in))
         
+        # Fuse them before the GRU
+        x = torch.cat([obs_feat, msg_feat], dim=-1)
         h_in = hidden.reshape(-1, self.hidden_dim)
         h = self.rnn(x, h_in)
         
-        # 2. Generate Physical Q-Values (Dueling)
         V = self.value_stream(h)
         A = self.advantage_stream(h)
         q_vals = V + A - A.mean(dim=1, keepdim=True)
         
-        # 3. Generate Differentiable Latent Message
-        msg_logits = self.msg_stream(h)
-        # Apply Gumbel-Softmax. hard=True ensures the output is a strict one-hot vector,
-        # but the Straight-Through Estimator allows continuous gradients to pass backward.
-        msg_probs = F.gumbel_softmax(msg_logits, tau=1.0, hard=True)
-        
-        # Map the one-hot selection to your literal vocabulary mapping
-        vocab = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32, device=obs.device)
-        # Multiply the one-hot probability by the vocab to get a single discrete float
-        msg_out = (msg_probs * vocab).sum(dim=-1, keepdim=True)
+        if self.vocab_size == 1:
+            msg_out = torch.zeros(h.size(0), 1, device=obs.device)
+        else:
+            msg_logits = self.msg_stream(h)
+            msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=True)
+            vocab = self.get_vocab_tensor(obs.device)
+            msg_out = (msg_probs * vocab).sum(dim=-1, keepdim=True)
         
         return q_vals, msg_out, h
 
+class QMixCommMAC(nn.Module):
+    def __init__(self, agent_network, num_agents=4):
+        super().__init__()
+        self.agent = agent_network
+        self.num_agents = num_agents
+        
+        self.register_buffer("adj_mask", torch.tensor([
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0]
+        ]))
+        
+        self.msg_buffer = None
+        self.rollout_msg_state = None 
 
-# ==============================================================================
-# 3. THE MIXING HYPERNETWORK (Shared by both Vanilla and Comm-QMIX)
-# ==============================================================================
+    def init_buffer(self, batch_size, device):
+        self.msg_buffer = torch.zeros(batch_size, self.num_agents, 1, device=device)
+        if batch_size == 1:
+            self.rollout_msg_state = torch.zeros(1, self.num_agents, 1, device=device)
+
+    def forward(self, obs, hiddens, tau=1.0):
+        B = obs.size(0)
+        
+        if B == 1:
+            if self.rollout_msg_state is None or self.rollout_msg_state.device != obs.device:
+                self.rollout_msg_state = torch.zeros(1, self.num_agents, 1, device=obs.device)
+            current_msgs = self.rollout_msg_state
+        else:
+            if self.msg_buffer is None or self.msg_buffer.size(0) != B:
+                self.msg_buffer = torch.zeros(B, self.num_agents, 1, device=obs.device)
+            current_msgs = self.msg_buffer
+
+        masked_msgs = torch.matmul(self.adj_mask, current_msgs)
+        
+        obs_flat = obs.view(B * self.num_agents, -1)
+        msg_flat = masked_msgs.view(B * self.num_agents, -1)
+        hiddens_flat = hiddens.view(B * self.num_agents, -1)
+        
+        q_vals, msg_out, next_hiddens = self.agent(obs_flat, msg_flat, hiddens_flat, tau=tau)
+        
+        msg_out_reshaped = msg_out.view(B, self.num_agents, 1)
+        
+        if B == 1:
+            self.rollout_msg_state = msg_out_reshaped.detach()
+            safe_logs = self.rollout_msg_state.cpu().numpy()
+        else:
+            self.msg_buffer = msg_out_reshaped
+            safe_logs = self.msg_buffer.detach().cpu().numpy()
+        
+        return q_vals.view(B, self.num_agents, -1), next_hiddens.view(B, self.num_agents, -1), safe_logs
+
 class QMixer(nn.Module):
     def __init__(self, n_agents, state_dim, mixing_embed_dim=256, hypernet_embed=64):
         super(QMixer, self).__init__()
-        
         self.n_agents = n_agents
         self.state_dim = state_dim
         self.mixing_embed_dim = mixing_embed_dim
         
-        # Hypernetwork 1
         self.hyper_w_1 = nn.Sequential(
-            nn.Linear(state_dim, hypernet_embed),
-            nn.ReLU(),
+            nn.Linear(state_dim, hypernet_embed), nn.ReLU(), 
             nn.Linear(hypernet_embed, n_agents * mixing_embed_dim)
         )
-        
-        # Hypernetwork 2
         self.hyper_w_2 = nn.Sequential(
-            nn.Linear(state_dim, hypernet_embed),
-            nn.ReLU(),
+            nn.Linear(state_dim, hypernet_embed), nn.ReLU(), 
             nn.Linear(hypernet_embed, mixing_embed_dim)
         )
         
-        # Bias Generators
         self.hyper_b_1 = nn.Linear(state_dim, mixing_embed_dim)
         self.hyper_b_2 = nn.Sequential(
-            nn.Linear(state_dim, mixing_embed_dim),
-            nn.ReLU(),
+            nn.Linear(state_dim, mixing_embed_dim), nn.ReLU(), 
             nn.Linear(mixing_embed_dim, 1)
         )
 
@@ -116,12 +147,10 @@ class QMixer(nn.Module):
         states = states.reshape(-1, self.state_dim)
         agent_qs = agent_qs.view(-1, 1, self.n_agents)
         
-        # Layer 1 Mixing (Enforcing strict monotonicity with absolute value)
         w1 = torch.abs(self.hyper_w_1(states)).view(-1, self.n_agents, self.mixing_embed_dim)
         b1 = self.hyper_b_1(states).view(-1, 1, self.mixing_embed_dim)
         hidden = F.elu(torch.bmm(agent_qs, w1) + b1)
         
-        # Layer 2 Mixing
         w2 = torch.abs(self.hyper_w_2(states)).view(-1, self.mixing_embed_dim, 1)
         b2 = self.hyper_b_2(states).view(-1, 1, 1)
         q_tot = torch.bmm(hidden, w2) + b2

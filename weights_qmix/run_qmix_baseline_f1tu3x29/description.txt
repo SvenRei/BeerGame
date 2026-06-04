@@ -1,0 +1,2 @@
+W&B Run Name: qmix_baseline
+Best Avg Cost: 43381.37

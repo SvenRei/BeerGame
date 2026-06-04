@@ -1,5 +1,6 @@
 algorithm: "comm_mappo"
 hidden_dim: 256
+vocab_size: 3  # <-- Added for the hyperparameter sweep (1, 3, 5)
 lr_actor: 3e-4
 lr_critic: 1e-3
 gamma: 0.99

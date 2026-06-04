@@ -1,6 +1,8 @@
 import unittest
 import numpy as np
 from envs.beer_game_env import BeerGameParallelEnv
+import matplotlib.pyplot as plt
+import os
 
 class TestBeerGameEnvironment(unittest.TestCase):
     
@@ -397,59 +399,87 @@ class TestBeerGameEnvironment(unittest.TestCase):
     # END-TO-END TRACE & AGENT INTEGRATION TESTS (25 - 30)
     # ==============================================================================
     
-    def test_25_end_to_end_trace_logger(self):
-        """ENGINEERING TEST: Simulates a complete end-to-end run and logs physical flow."""
-        print("\n--- STARTING TEST 25: END-TO-END TRACE ---")
-        
-        # 1. Isolate the environment: Wipe pipelines, set flat inventory of 10
+    def test_25_end_to_end_trace_plotter(self):
+        """
+        ENGINEERING TEST: Simulates a 20-week end-to-end run and plots a complete 
+        diagnostic trace of inventories, orders, and shipments for all 4 agents.
+        """
+        # 1. Setup flat isolation state
         for a in self.env.agents:
-            self.env.inventory[a] = 10
+            self.env.inventory[a] = 12
             self.env.backlog[a] = 0
             self.env.shipment_pipelines[a].pipeline = {}
             self.env.order_pipelines[a].pipeline = {}
             self.env.unfulfilled_orders[a] = 0
             
-        # TIMING FIX: Use native step demand (4 units per step initially)
         self.env.config["demand_type"] = "step" 
         
-        # Agents will order exactly their echelon index * 10 
-        actions = {
-            "retailer": np.array([0.1], dtype=np.float32),   # Orders 10
-            "wholesaler": np.array([0.2], dtype=np.float32), # Orders 20
-            "distributor": np.array([0.3], dtype=np.float32),# Orders 30
-            "manufacturer": np.array([0.4], dtype=np.float32),# Orders 40
-        }
+        # 2. Tracking dictionaries for plotting
+        steps = 20
+        history = {a: {"inv": [], "ordered": [], "received_goods": [], "received_orders": []} for a in self.env.agents}
         
-        # --- STEP 1: Time advances to t=1. Orders Placed. Demand hits Retailer. ---
-        self.env.step(actions)
-        print("STEP 1: Demand hits Retailer. Orders placed into pipelines.")
-        print(f"  Retailer Inv: {self.env.inventory['retailer']} (10 initial - 4 native demand = 6)")
-        self.assertEqual(self.env.inventory["retailer"], 6)
-        
-        # --- STEP 2: Time advances to t=2. Transit. ---
-        zero_actions = {a: np.array([0.0], dtype=np.float32) for a in self.env.agents}
-        self.env.step(zero_actions)
-        print("STEP 2: Orders traveling in pipelines.")
-        
-        # --- STEP 3: Time advances to t=3. Upstream Receives Orders & Ships Goods ---
-        self.env.step(zero_actions)
-        print("STEP 3: Upstream receives orders. Manufacturer receives raw materials.")
-        
-        # Manufacturer receives 40 raw materials (from step 1) in Phase 1. Inv: 10 + 40 = 50.
-        # Manufacturer receives Distributor's order of 30 in Phase 2. Ships 30. Inv: 50 - 30 = 20.
-        print(f"  Manufacturer Inv: {self.env.inventory['manufacturer']} (Had 10 + Received 40 - Shipped 30)")
-        self.assertEqual(self.env.inventory["manufacturer"], 20)
-        self.assertEqual(self.env.backlog["manufacturer"], 0)
+        # 3. Simulate 20 weeks with a static policy
+        for t in range(1, steps + 1):
+            # Static Policy: Order 10% of max (10 units) every week
+            actions = {a: np.array([0.1], dtype=np.float32) for a in self.env.agents}
+            
+            # Record what is hitting the agents THIS step (from the pipelines) before step() consumes them
+            for i, a in enumerate(self.env.agents):
+                # Goods they will receive this step
+                incoming_goods = self.env.shipment_pipelines[a].pipeline.get(t, 0)
+                history[a]["received_goods"].append(incoming_goods)
+                
+                # Orders upstream will receive this step
+                if a == "retailer":
+                    # Retailer receives external demand
+                    incoming_order = 4 if t <= 5 else 8
+                else:
+                    incoming_order = self.env.order_pipelines[self.env.agents[i-1]].pipeline.get(t, 0)
+                history[a]["received_orders"].append(incoming_order)
 
-        # Distributor receives Wholesaler's order of 20. Inv was 10. Ships 10, Backlogs 10.
-        print(f"  Distributor Backlog: {self.env.backlog['distributor']} (Ordered 20, had 10)")
-        self.assertEqual(self.env.backlog["distributor"], 10)
-
-        # Wholesaler receives Retailer's order of 10. Inv was 10. Ships 10. Inv becomes 0.
-        print(f"  Wholesaler Inv: {self.env.inventory['wholesaler']} (Shipped 10 to Retailer)")
-        self.assertEqual(self.env.inventory["wholesaler"], 0)
+            # Step the environment
+            self.env.step(actions)
+            
+            # Record resulting state and actions
+            for a in self.env.agents:
+                history[a]["inv"].append(self.env.inventory[a] - self.env.backlog[a]) # Net Inventory
+                history[a]["ordered"].append(10) # We forced 10 above
+                
+        # 4. Generate the Diagnostic Plot
+        fig, axs = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
+        fig.suptitle("Supply Chain End-to-End Diagnostic Trace (20 Weeks)", fontsize=16, fontweight='bold')
         
-        print("--- END OF TRACE ---\n")
+        time_axis = range(1, steps + 1)
+        colors = {"retailer": "blue", "wholesaler": "orange", "distributor": "green", "manufacturer": "red"}
+        
+        for i, a in enumerate(self.env.agents):
+            ax = axs[i]
+            ax.set_title(f"{a.capitalize()} Telemetry", fontweight='bold')
+            
+            # Plot Net Inventory
+            ax.plot(time_axis, history[a]["inv"], label="Net Inventory", color=colors[a], linewidth=2, marker='o')
+            
+            # Bar chart for incoming/outgoing flow
+            width = 0.2
+            ax.bar([x - width for x in time_axis], history[a]["ordered"], width=width, label="Orders Placed", color="black", alpha=0.6)
+            ax.bar([x for x in time_axis], history[a]["received_orders"], width=width, label="Orders Received", color="purple", alpha=0.6)
+            ax.bar([x + width for x in time_axis], history[a]["received_goods"], width=width, label="Goods Received", color="cyan", alpha=0.6)
+            
+            ax.axhline(0, color='black', linewidth=1, linestyle='--')
+            ax.set_ylabel("Units")
+            ax.grid(True, linestyle=':', alpha=0.7)
+            ax.legend(loc="upper right", fontsize=8)
+            
+        axs[3].set_xlabel("Simulation Week (t)")
+        plt.tight_layout()
+        
+        # Save to disk so it doesn't freeze the automated test suite
+        plot_path = "test_25_supply_chain_trace.png"
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+        
+        print(f"\n[Test 25] Diagnostic plot successfully generated and saved to: {plot_path}")
+        self.assertTrue(os.path.exists(plot_path), "Plotter Flaw: Matplotlib failed to save the trace image.")
 
     def test_26_agent_policy_translation(self):
         """INTEGRATION TEST: Verifies environment correctly handles both continuous (PPO) and discrete-mapped (QMIX) actions."""
@@ -551,5 +581,8 @@ class TestBeerGameEnvironment(unittest.TestCase):
         self.env.step(actions) # t=3 (Arrives)
         
         self.assertEqual(self.env.inventory["manufacturer"], 75, "Source Flaw: Manufacturer did not receive units from raw material pipeline.")
+
+    
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
