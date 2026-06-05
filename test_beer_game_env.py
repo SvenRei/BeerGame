@@ -382,17 +382,25 @@ class TestBeerGameEnvironment(unittest.TestCase):
 
     def test_33_stochastic_demand_is_actually_realized_in_fulfillment(self):
         env, _, _ = self._make_env({"demand_type": "black_swan", "horizon": 30}, seed=0)
-        for _ in range(23):
+        
+        # Step 1 through 22 (Normal RNG)
+        for _ in range(22):
             env.step(self._actions_for_order(env, 0))
             
+        # Swap RNG early to guarantee we catch the env's pre-rolling for week 25,
+        # regardless of how far ahead the physics engine caches demand.
         env.np_random = RecordingRNG() 
-        env.step(self._actions_for_order(env, 0)) 
         
+        # Step 23 and 24 (Mock RNG)
+        env.step(self._actions_for_order(env, 0)) # Step 23
+        env.step(self._actions_for_order(env, 0)) # Step 24
+        
+        # At the end of step 24, the next incoming order (week 25) is fully visible
         black_swan_demand = env._build_obs("retailer")[3]
         self.assertEqual(black_swan_demand, 20)
         
         retailer_backlog_before = env.backlog["retailer"]
-        env.step(self._actions_for_order(env, 0)) 
+        env.step(self._actions_for_order(env, 0)) # Step 25 processes the 20 cases
         retailer_backlog_after = env.backlog["retailer"]
         
         self.assertEqual(retailer_backlog_after - retailer_backlog_before, 20)
@@ -468,13 +476,12 @@ class TestBeerGameEnvironment(unittest.TestCase):
 
     def test_43_get_global_state_is_true_unclipped_physical_state(self):
         env, _, _ = self._make_env()
-        # Set extreme physical state
         env.inventory["retailer"] = 15000 
         global_state = env.get_global_state()
         
-        # Verify it returns unclipped raw values rather than just clipped concatenated obs
         self.assertIn(15000.0, global_state)
-        expected_len = 4 * (3 + env.config["lookahead"])
+        # Expected dim: step + 4 agents * (inv + back + unful + ship_pipe(15) + order_pipe(15)) + next_demand
+        expected_len = 1 + 4 * (3 + (15 * 2)) + 1
         self.assertEqual(global_state.shape, (expected_len,))
 
     # ==============================================================================
@@ -491,7 +498,6 @@ class TestBeerGameEnvironment(unittest.TestCase):
 
     def test_46_config_is_strictly_immutable_after_init(self):
         env, _, _ = self._make_env({"demand_type": "zero"}, seed=0)
-        # Verify the @property returns a copy, meaning external mutation is blocked
         env.config["demand_type"] = "black_swan"
         self.assertEqual(env._config["demand_type"], "zero")
 
@@ -549,10 +555,7 @@ class TestBeerGameEnvironment(unittest.TestCase):
     def test_54_observation_is_pure_and_does_not_consume_rng(self):
         env, _, _ = self._make_env({"demand_type": "black_swan", "horizon": 30}, seed=0)
         rng_state_before = env.np_random.bit_generator.state
-        
-        # This used to roll demand and mutate the RNG. It should now be pure.
         obs = env._build_obs("retailer")
-        
         rng_state_after = env.np_random.bit_generator.state
         self.assertEqual(rng_state_before, rng_state_after)
 
@@ -646,20 +649,15 @@ class TestBeerGameEnvironment(unittest.TestCase):
         
     def test_66_bankers_rounding_avoided(self):
         env, _, _ = self._make_env({"max_order": 2}, seed=0)
-        # ENGINEER FIX: float32 precision requires an exact binary fraction
-        # raw_action = 0.25 * 2 = 0.5. NumPy Banker's rounding yields 0. Math Floor+0.5 yields 1.
         actions = self._actions_for_order(env, 0)
         actions["retailer"] = np.array([0.25], dtype=np.float32) 
         env.step(actions)
-        # Verify the order placed into the pipeline was exactly 1
         self.assertEqual(env.order_pipelines["retailer"].pipeline.get(3, 0), 1)
 
     def test_67_current_incoming_order_is_diagnostic_only(self):
         env, _, _ = self._make_env({"demand_type": "step", "horizon": 10}, seed=0)
         obs, _, _, _, _ = env.step(self._actions_for_order(env, 4))
-        # After step 1 is done, it processed week 1 demand (4.0).
         self.assertEqual(env.current_incoming_order["retailer"], 4.0)
-        # But the returned observation is peaking at week 2 (4.0). 
         self.assertEqual(obs["retailer"][3], 4.0)
 
     def test_68_long_rollout_invariants_fuzzing(self):
@@ -684,6 +682,141 @@ class TestBeerGameEnvironment(unittest.TestCase):
                         self.assertTrue(isinstance(qty, (int, np.integer)))
                         self.assertGreaterEqual(arr_step, env.current_step)
                         self.assertGreater(qty, 0)
+
+    def test_69_global_state_is_true_markov_state(self):
+        env1, _, _ = self._make_env({"lookahead": 2})
+        env2, _, _ = self._make_env({"lookahead": 2})
+        
+        env1.shipment_pipelines["retailer"].add_shipment(0, 10, 1)
+        env2.shipment_pipelines["retailer"].add_shipment(0, 10, 1)
+        env2.shipment_pipelines["retailer"].add_shipment(0, 50, 12)
+        
+        state1 = env1.get_global_state()
+        state2 = env2.get_global_state()
+        
+        self.assertFalse(np.array_equal(state1, state2))
+
+    def test_70_global_state_raises_on_stochastic_cache_miss(self):
+        env, _, _ = self._make_env({"demand_type": "black_swan"})
+        env.stochastic_demand_cache.clear()
+        with self.assertRaises(RuntimeError):
+            env.get_global_state()
+
+    def test_71_extreme_chaos_sequential_rollout(self):
+        env, _, _ = self._make_env({"demand_type": "extreme_chaos", "horizon": 40}, seed=0)
+        env.np_random = RecordingRNG(integer_value=12) 
+        
+        for _ in range(9): env.step(self._actions_for_order(env, 0))
+        self.assertEqual(env.current_incoming_order["retailer"], 8)
+        
+        for _ in range(10): env.step(self._actions_for_order(env, 0))
+        self.assertEqual(env.current_incoming_order["retailer"], 30)
+        
+        for _ in range(10): env.step(self._actions_for_order(env, 0))
+        self.assertEqual(env.current_incoming_order["retailer"], 0)
+        
+        env.step(self._actions_for_order(env, 0))
+        self.assertEqual(env.current_incoming_order["retailer"], 12)
+
+    def test_72_final_step_semantics_documents_no_future_pollution(self):
+        env, _, _ = self._make_env({"horizon": 1}, seed=0)
+        _, rewards1, _, _, _ = env.step(self._actions_for_order(env, 10))
+        
+        env2, _, _ = self._make_env({"horizon": 1}, seed=0)
+        _, rewards2, _, _, _ = env2.step(self._actions_for_order(env2, 90))
+        
+        self.assertEqual(rewards1["retailer"], rewards2["retailer"])
+        self.assertNotIn(3, env.order_pipelines["retailer"].pipeline)
+
+    def test_73_max_order_rl_variant_documented(self):
+        env, _, _ = self._make_env({"max_order": 100}, seed=0)
+        actions = self._actions_for_order(env, 0)
+        
+        actions["retailer"] = np.array([0.0], dtype=np.float32)
+        env.step(actions)
+        self.assertEqual(env.order_pipelines["retailer"].pipeline.get(3, 0), 0)
+        
+        actions["retailer"] = np.array([1.0], dtype=np.float32)
+        env.step(actions)
+        self.assertEqual(env.order_pipelines["retailer"].pipeline.get(4, 0), 100)
+        
+        actions["retailer"] = np.array([10.0], dtype=np.float32)
+        env.step(actions)
+        self.assertEqual(env.order_pipelines["retailer"].pipeline.get(5, 0), 100)
+        
+    def test_74_stochastic_demand_is_rolled_exactly_once_per_week(self):
+        env, _, _ = self._make_env({"demand_type": "black_swan", "horizon": 5}, seed=0)
+        env.np_random = RecordingRNG()
+        
+        for i in range(3):
+            calls_before = len(env.np_random.poisson_lams)
+            env.step(self._actions_for_order(env, 0))
+            calls_after = len(env.np_random.poisson_lams)
+            
+            # Verify exactly 1 roll occurred during the environment step
+            self.assertEqual(calls_after - calls_before, 1)
+            
+    def test_75_invalid_falsy_demand_types_rejected(self):
+        with self.assertRaises(ValueError): self._make_env({"demand_type": False})
+        with self.assertRaises(ValueError): self._make_env({"demand_type": 0})
+        with self.assertRaises(ValueError): self._make_env({"demand_type": ""})
+        
+        env, _, _ = self._make_env({"demand_type": None})
+        self.assertEqual(env.config["demand_type"], "step")
+
+    def test_76_non_dict_actions_raise_error(self):
+        env, _, _ = self._make_env()
+        with self.assertRaises(ValueError): env.step(None)
+        with self.assertRaises(ValueError): env.step([])
+        with self.assertRaises(ValueError): env.step(np.array([1, 2, 3]))
+
+    def test_77_boolean_and_numeric_string_actions_rejected(self):
+        env, _, _ = self._make_env()
+        bad_actions = self._actions_for_order(env, 0)
+        
+        bad_actions["retailer"] = [True]
+        with self.assertRaises(ValueError): env.step(bad_actions)
+            
+        bad_actions["retailer"] = np.array([False])
+        with self.assertRaises(ValueError): env.step(bad_actions)
+            
+        bad_actions["retailer"] = ["0.5"]
+        with self.assertRaises(ValueError): env.step(bad_actions)
+
+    def test_78_complex_numpy_scalars_rejected(self):
+        env, _, _ = self._make_env()
+        bad_actions = self._actions_for_order(env, 0)
+        bad_actions["retailer"] = np.array([1 + 2j])
+        with self.assertRaises(ValueError): env.step(bad_actions)
+
+    def test_79_near_integer_quantities_rejected(self):
+        env, _, _ = self._make_env()
+        with self.assertRaises(ValueError):
+            env.shipment_pipelines["retailer"].add_shipment(1, 1.000000001, 2)
+        with self.assertRaises(ValueError):
+            env.shipment_pipelines["retailer"].add_shipment(1, 0.999999999, 2)
+            
+        env.shipment_pipelines["retailer"].add_shipment(1, 2.0, 2)
+        self.assertEqual(env.shipment_pipelines["retailer"].pipeline.get(3), 2)
+
+    def test_80_comprehensive_long_rollout_invariants(self):
+        modes = ["step", "zero", "black_swan", "extreme_chaos"]
+        for mode in modes:
+            for jitter in [True, False]:
+                env, _, _ = self._make_env({
+                    "horizon": 20, 
+                    "demand_type": mode, 
+                    "jittery_lead_time": jitter
+                }, seed=42)
+                
+                for step in range(20):
+                    actions = {a: np.array([env.action_space(a).sample()[0]], dtype=np.float32) for a in env.agents}
+                    obs, rewards, _, _, infos = env.step(actions)
+                    
+                    for agent in env.possible_agents:
+                        self.assertGreaterEqual(env.inventory[agent], 0)
+                        self.assertGreaterEqual(env.backlog[agent], 0)
+                        self.assertGreaterEqual(env.unfulfilled_orders[agent], 0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7,7 +7,10 @@ def _is_strict_int(v):
     return isinstance(v, (int, np.integer)) and not isinstance(v, bool)
 
 def _is_strict_num(v):
-    return isinstance(v, (int, float, np.number)) and not isinstance(v, bool) and not isinstance(v, complex)
+    # ENGINEER FIX: Explicitly block NumPy complex types (np.complex64, np.complex128)
+    if isinstance(v, bool) or isinstance(v, complex) or np.iscomplexobj(v):
+        return False
+    return isinstance(v, (int, float, np.number))
 
 class TransitPipeline:
     def __init__(self):
@@ -18,7 +21,7 @@ class TransitPipeline:
             raise ValueError(f"current_step must be non-negative int, got {type(current_step)}")
         if not _is_strict_num(quantity) or not np.isfinite(quantity) or quantity < 0:
             raise ValueError(f"Quantity must be finite and non-negative, got {quantity}")
-        if not np.isclose(float(quantity), np.round(float(quantity)), rtol=0, atol=1e-9):
+        if not float(quantity).is_integer():
             raise ValueError(f"Quantity must be a discrete whole number, got {quantity}")
         if not _is_strict_int(lead_time) or lead_time <= 0:
             raise ValueError(f"Lead time must be a strictly positive integer, got {lead_time}")
@@ -62,11 +65,13 @@ class BeerGameParallelEnv(ParallelEnv):
         jitter = self._config.get("jittery_lead_time", False)
         if type(jitter) is not bool: raise ValueError("jittery_lead_time must be a strict boolean")
         
+        demand_type = self._config.get("demand_type", None)
+        if demand_type is None:
+            demand_type = "step"
         valid_demands = ["step", "zero", "black_swan", "extreme_chaos"]
-        demand_type = self._config.get("demand_type", "step")
-        if demand_type and demand_type not in valid_demands:
+        if demand_type not in valid_demands:
             raise ValueError(f"Invalid demand_type: {demand_type}")
-        self._config["demand_type"] = demand_type or "step" 
+        self._config["demand_type"] = demand_type
         
         self.np_random = np.random.default_rng()
         self._action_spaces = {a: Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32) for a in self.possible_agents}
@@ -75,7 +80,7 @@ class BeerGameParallelEnv(ParallelEnv):
 
     @property
     def config(self):
-        """Returns a copy of the config so it cannot be mutated mid-episode."""
+        """Read-only property preventing runtime mutation."""
         return self._config.copy()
 
     @functools.lru_cache(maxsize=None)
@@ -99,6 +104,7 @@ class BeerGameParallelEnv(ParallelEnv):
             self.order_pipelines[a].pipeline = {1: 4} if a == "manufacturer" else {1: 4, 2: 4}
                 
         self.unfulfilled_orders = {a: sum(self.shipment_pipelines[a].pipeline.values()) + sum(self.order_pipelines[a].pipeline.values()) for a in self.possible_agents}
+        
         self.stochastic_demand_cache = {}
         if self._config.get("demand_type") not in ["step", "zero"]:
             self.stochastic_demand_cache[1] = self._roll_stochastic_demand(1)
@@ -108,11 +114,26 @@ class BeerGameParallelEnv(ParallelEnv):
         return {a: self._build_obs(a) for a in self.agents}, {a: {} for a in self.agents}
 
     def get_global_state(self):
-        state = []
+        """Returns the true unclipped physical global state (inventory, backlog, open orders, pipelines, time)."""
+        state = [float(self.current_step)]
+        MAX_DELAY = 15
         for a in self.possible_agents:
             state.extend([self.inventory[a], self.backlog[a], self.unfulfilled_orders[a]])
-            for t in range(1, self.lookahead + 1):
+            for t in range(1, MAX_DELAY + 1):
                 state.append(self.shipment_pipelines[a].pipeline.get(self.current_step + t, 0))
+                state.append(self.order_pipelines[a].pipeline.get(self.current_step + t, 0))
+                
+        d_type = self._config.get("demand_type")
+        if d_type == "step":
+            next_d = 4.0 if self.current_step + 1 < 5 else 8.0
+        elif d_type == "zero":
+            next_d = 0.0
+        else:
+            if self.current_step + 1 not in self.stochastic_demand_cache:
+                 raise RuntimeError(f"Demand cache miss for step {self.current_step + 1}. Observer effect detected.")
+            next_d = float(self.stochastic_demand_cache[self.current_step + 1])
+        state.append(next_d)
+        
         return np.array(state, dtype=np.float32)
 
     def _roll_stochastic_demand(self, step):
@@ -142,18 +163,27 @@ class BeerGameParallelEnv(ParallelEnv):
         return np.clip(np.array(obs, dtype=np.float32), -2000.0, 2000.0)
 
     def _validate_actions(self, actions):
+        if not isinstance(actions, dict):
+            raise ValueError(f"Actions must be a dict, got {type(actions)}")
         if set(actions.keys()) != set(self.agents):
             raise ValueError(f"Action keys mismatch. Expected {self.agents}")
+            
         for agent in self.agents:
             act = actions[agent]
+            
             if isinstance(act, str) or isinstance(act, bool) or isinstance(act, complex):
                 raise ValueError("Action must be a numeric array")
+            
             try:
-                act_array = np.array(act, dtype=float)
+                act_raw = np.array(act)
             except Exception:
-                raise ValueError(f"Action for {agent} is not convertible to float.")
-            if act_array.dtype == bool or not np.issubdtype(act_array.dtype, np.number):
-                raise ValueError("Action array must contain purely numbers")
+                raise ValueError(f"Action for {agent} is invalid.")
+                
+            if act_raw.dtype == bool or not np.issubdtype(act_raw.dtype, np.number) or np.iscomplexobj(act_raw):
+                raise ValueError(f"Action for {agent} must be a pure numeric array. Got dtype {act_raw.dtype}")
+                
+            act_array = act_raw.astype(float)
+            
             if act_array.shape != (1,):
                 raise ValueError(f"Action for {agent} must be shape (1,), got {act_array.shape}")
             if not np.isfinite(act_array[0]):
@@ -168,9 +198,6 @@ class BeerGameParallelEnv(ParallelEnv):
         self.current_step += 1
         rewards, terminations, truncations, infos = {}, {}, {}, {}
         total_system_cost = 0.0
-
-        if self._config.get("demand_type") not in ["step", "zero"]:
-            self.stochastic_demand_cache[self.current_step + 1] = self._roll_stochastic_demand(self.current_step + 1)
 
         # --- PHASE 1: RECEIVE INCOMING GOODS ---
         for agent in self.possible_agents:
@@ -211,6 +238,12 @@ class BeerGameParallelEnv(ParallelEnv):
                 if order > 0:
                     lead_time = 1 if agent == "manufacturer" else 2
                     self.order_pipelines[agent].add_shipment(self.current_step, order, lead_time=lead_time)
+
+        # --- PRE-ROLL FUTURE DEMAND ---
+        next_lookahead = self.current_step + 2
+        if self._config.get("demand_type") not in ["step", "zero"]:
+            if next_lookahead not in self.stochastic_demand_cache:
+                self.stochastic_demand_cache[next_lookahead] = self._roll_stochastic_demand(next_lookahead)
 
         # --- PHASE 4: ACCOUNTING & REWARDS ---
         done = self.current_step >= self.horizon
