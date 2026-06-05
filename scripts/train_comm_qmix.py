@@ -9,12 +9,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer
 
-# ENGINEER FIX: ReplayBuffer now stores the hidden state to preserve GRU memory
+# ENGINEER FIX: ReplayBuffer now stores BOTH hidden and next_hidden to preserve temporal alignment
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
-    def push(self, state, obs, acts, reward, next_state, next_obs, done, hidden):
-        self.buffer.append((state, obs, acts, reward, next_state, next_obs, done, hidden))
+    # Added next_hidden to the push signature
+    def push(self, state, obs, acts, reward, next_state, next_obs, done, hidden, next_hidden):
+        self.buffer.append((state, obs, acts, reward, next_state, next_obs, done, hidden, next_hidden))
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
     def __len__(self):
@@ -66,7 +67,6 @@ def main(cfg: DictConfig):
     print(f"--- Starting COMM_QMIX Training Marathon ---")
 
     for ep in range(cfg.total_episodes):
-        # ENGINEER FIX: Calculate dynamic tau
         tau = max(0.05, 5.0 * (1.0 - ep / cfg.total_episodes))
         
         obs, _ = env.reset(seed=1000 + ep)
@@ -82,7 +82,6 @@ def main(cfg: DictConfig):
             state = np.concatenate([obs[a] for a in sorted(env.agents)])
             
             with torch.no_grad():
-                # ENGINEER FIX: Pass tau
                 q_vals, next_hiddens, safe_logs = mac(obs_tensor, hiddens_tensor, tau=tau)
                 episode_messages.append(safe_logs)
                 
@@ -107,14 +106,13 @@ def main(cfg: DictConfig):
             
             done = any(terms.values()) or any(truncs.values())
             
-            # Pushed to buffer with hidden state
-            buffer.push(state, obs_array, actions_list, global_reward, next_state, next_obs_array, done, hiddens_tensor.detach().cpu().numpy())
+            # ENGINEER FIX: Pushing BOTH current hiddens AND next hiddens
+            buffer.push(state, obs_array, actions_list, global_reward, next_state, next_obs_array, done, hiddens_tensor.detach().cpu().numpy(), next_hiddens.detach().cpu().numpy())
             
             obs = next_obs
             hiddens_tensor = next_hiddens
             global_step += 1
             
-            # --- TRAINING STEP ---
             if len(buffer) > cfg.agent.batch_size:
                 batch = buffer.sample(cfg.agent.batch_size)
                 
@@ -125,20 +123,23 @@ def main(cfg: DictConfig):
                 b_next_states = torch.tensor(np.array([b[4] for b in batch]), dtype=torch.float32).to(device)
                 b_next_obs = torch.tensor(np.array([b[5] for b in batch]), dtype=torch.float32).to(device)
                 b_dones = torch.tensor(np.array([b[6] for b in batch]), dtype=torch.float32).unsqueeze(1).to(device)
-                # ENGINEER FIX: Extract stored hidden state
+                
+                # ENGINEER FIX: Extract BOTH hidden states
                 b_h = torch.tensor(np.array([b[7] for b in batch]), dtype=torch.float32).to(device)
+                b_next_h = torch.tensor(np.array([b[8] for b in batch]), dtype=torch.float32).to(device)
                 
                 mac.init_buffer(cfg.agent.batch_size, device)
                 target_mac.init_buffer(cfg.agent.batch_size, device)
                 
-                # Pass tau and b_h
+                # Calculate current Q values using b_h
                 q_evals, _, _ = mac(b_obs, b_h, tau=tau)
                 chosen_q_evals = torch.gather(q_evals, dim=2, index=b_actions)
                 
                 with torch.no_grad():
-                    online_next_q, _, _ = mac(b_next_obs, b_h, tau=tau)
+                    # ENGINEER FIX: Calculate Next Q values strictly using b_next_h
+                    online_next_q, _, _ = mac(b_next_obs, b_next_h, tau=tau)
                     best_next_actions = online_next_q.argmax(dim=2, keepdim=True)
-                    target_q, _, _ = target_mac(b_next_obs, b_h, tau=tau)
+                    target_q, _, _ = target_mac(b_next_obs, b_next_h, tau=tau)
                     target_q_evals = torch.gather(target_q, dim=2, index=best_next_actions)
                     
                 q_tot = mixer(chosen_q_evals, b_states)
