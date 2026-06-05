@@ -99,8 +99,12 @@ def main(cfg: DictConfig):
                 env_acts[a] = [action_idx / (n_actions - 1)]
                 
             next_obs, rewards, terms, truncs, infos = env.step(env_acts)
-            ep_cost += sum(infos[a]["local_cost"] for a in env.agents)
-            global_reward = -sum(infos[a]["local_cost"] for a in env.agents) / 100.0
+            raw_cost = sum(infos[a]["local_cost"] for a in env.agents)
+            ep_cost += raw_cost
+            # ENGINEER FIX: Log-scale the reward to prevent Q-value gradient explosion
+            # np.log1p(x) safely calculates log(1 + x), compressing 80,000 down to a safe -11.2 penalty
+            global_reward = -np.log1p(raw_cost)
+
             next_state = np.concatenate([next_obs[a] for a in sorted(env.agents)])
             next_obs_array = np.stack([next_obs[a] for a in env.agents])
             

@@ -24,3 +24,5 @@ wandb>=0.15.0
 # Plotting & Statistics
 matplotlib>=3.7.0
 seaborn>=0.12.2
+
+pytest

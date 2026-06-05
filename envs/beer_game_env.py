@@ -2,147 +2,231 @@ import functools
 import numpy as np
 from pettingzoo.utils.env import ParallelEnv
 from gymnasium.spaces import Box
-from .transit_pipeline import TransitPipeline
+
+def _is_strict_int(v):
+    return isinstance(v, (int, np.integer)) and not isinstance(v, bool)
+
+def _is_strict_num(v):
+    return isinstance(v, (int, float, np.number)) and not isinstance(v, bool) and not isinstance(v, complex)
+
+class TransitPipeline:
+    def __init__(self):
+        self.pipeline = {}
+        
+    def add_shipment(self, current_step, quantity, lead_time):
+        if not _is_strict_int(current_step) or current_step < 0:
+            raise ValueError(f"current_step must be non-negative int, got {type(current_step)}")
+        if not _is_strict_num(quantity) or not np.isfinite(quantity) or quantity < 0:
+            raise ValueError(f"Quantity must be finite and non-negative, got {quantity}")
+        if not np.isclose(float(quantity), np.round(float(quantity)), rtol=0, atol=1e-9):
+            raise ValueError(f"Quantity must be a discrete whole number, got {quantity}")
+        if not _is_strict_int(lead_time) or lead_time <= 0:
+            raise ValueError(f"Lead time must be a strictly positive integer, got {lead_time}")
+            
+        if int(quantity) == 0:
+            return 
+            
+        arr = current_step + int(lead_time)
+        self.pipeline[arr] = self.pipeline.get(arr, 0) + int(quantity)
+        
+    def receive_shipment(self, current_step):
+        if not _is_strict_int(current_step) or current_step < 0:
+            raise ValueError("current_step must be a non-negative integer")
+        return self.pipeline.pop(current_step, 0)
 
 class BeerGameParallelEnv(ParallelEnv):
-    metadata = {"render_modes": ["human"], "name": "beer_game_v0"}
+    metadata = {"name": "beer_game_v0"}
 
     def __init__(self, config):
-        self.agents = ["retailer", "wholesaler", "distributor", "manufacturer"]
-        self.possible_agents = self.agents[:]
+        self.possible_agents = ["retailer", "wholesaler", "distributor", "manufacturer"]
+        self.agents = self.possible_agents[:]
         
-        self.config = config
-        self.horizon = config.get("horizon", 50)
-        self.max_order = config.get("max_order", 100) 
-        self.h = config.get("holding_cost", 0.5)
-        self.b = config.get("backorder_cost", 1.0)
-        self.lookahead = config.get("lookahead", 4)
+        self._config = config.copy() if config else {}
+        self.horizon = self._config.get("horizon", 50)
+        self.max_order = self._config.get("max_order", 100) 
+        self.h = self._config.get("holding_cost", 0.5)
+        self.b = self._config.get("backorder_cost", 1.0)
+        self.lookahead = self._config.get("lookahead", 4)
         
-        self._action_spaces = {a: Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32) for a in self.agents}
+        if not _is_strict_int(self.horizon) or self.horizon <= 0: raise ValueError("Horizon must be pos int")
+        if not _is_strict_int(self.max_order) or self.max_order <= 0: raise ValueError("Max order must be pos int")
+        if not _is_strict_int(self.lookahead) or self.lookahead < 0: raise ValueError("Lookahead must be non-negative int")
+            
+        if not _is_strict_num(self.h) or not _is_strict_num(self.b): raise ValueError("Costs must be numeric")
+        if not np.isfinite(self.h) or not np.isfinite(self.b) or self.h < 0 or self.b < 0: raise ValueError("Costs must be finite positive")
+            
+        alpha = self._config.get("reward_alpha", 1.0)
+        if not _is_strict_num(alpha) or not (0.0 <= alpha <= 1.0) or not np.isfinite(alpha):
+            raise ValueError("reward_alpha must be finite in [0, 1]")
+            
+        jitter = self._config.get("jittery_lead_time", False)
+        if type(jitter) is not bool: raise ValueError("jittery_lead_time must be a strict boolean")
         
-        obs_dim = 3 + self.lookahead
-        self._observation_spaces = {a: Box(low=-2000.0, high=2000.0, shape=(obs_dim,), dtype=np.float32) for a in self.agents}
+        valid_demands = ["step", "zero", "black_swan", "extreme_chaos"]
+        demand_type = self._config.get("demand_type", "step")
+        if demand_type and demand_type not in valid_demands:
+            raise ValueError(f"Invalid demand_type: {demand_type}")
+        self._config["demand_type"] = demand_type or "step" 
+        
+        self.np_random = np.random.default_rng()
+        self._action_spaces = {a: Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32) for a in self.possible_agents}
+        obs_dim = 4 + self.lookahead
+        self._observation_spaces = {a: Box(low=-2000.0, high=2000.0, shape=(obs_dim,), dtype=np.float32) for a in self.possible_agents}
+
+    @property
+    def config(self):
+        """Returns a copy of the config so it cannot be mutated mid-episode."""
+        return self._config.copy()
 
     @functools.lru_cache(maxsize=None)
-    def observation_space(self, agent): 
-        return self._observation_spaces[agent]
+    def observation_space(self, agent): return self._observation_spaces[agent]
         
     @functools.lru_cache(maxsize=None)
-    def action_space(self, agent): 
-        return self._action_spaces[agent]
+    def action_space(self, agent): return self._action_spaces[agent]
 
     def reset(self, seed=None, options=None):
-        if seed is not None: 
-            np.random.seed(seed)
-            
+        if seed is not None: self.np_random = np.random.default_rng(seed)
+        self.agents = self.possible_agents[:]
         self.current_step = 0
-        self.inventory = {a: 12 for a in self.agents}
-        self.backlog = {a: 0 for a in self.agents}
+        self.inventory = {a: 12 for a in self.possible_agents}
+        self.backlog = {a: 0 for a in self.possible_agents}
         
-        # FIX (Test 18): Strict POMDP Ledger Initialization
-        # 4 units ordered at t=-1, 4 units ordered at t=-2 (Steady State)
-        self.unfulfilled_orders = {a: 8 for a in self.agents}
+        self.order_pipelines = {a: TransitPipeline() for a in self.possible_agents}
+        self.shipment_pipelines = {a: TransitPipeline() for a in self.possible_agents}
         
-        self.order_pipelines = {a: TransitPipeline() for a in self.agents}
-        self.shipment_pipelines = {a: TransitPipeline() for a in self.agents}
-        
-        for a in self.agents:
-            for t in range(1, 3):
-                self.shipment_pipelines[a].add_shipment(0, 4, t)
-                self.order_pipelines[a].add_shipment(0, 4, t) 
+        for a in self.possible_agents:
+            self.shipment_pipelines[a].pipeline = {1: 4, 2: 4}
+            self.order_pipelines[a].pipeline = {1: 4} if a == "manufacturer" else {1: 4, 2: 4}
                 
+        self.unfulfilled_orders = {a: sum(self.shipment_pipelines[a].pipeline.values()) + sum(self.order_pipelines[a].pipeline.values()) for a in self.possible_agents}
+        self.stochastic_demand_cache = {}
+        if self._config.get("demand_type") not in ["step", "zero"]:
+            self.stochastic_demand_cache[1] = self._roll_stochastic_demand(1)
+            self.stochastic_demand_cache[2] = self._roll_stochastic_demand(2)
+
+        self.current_incoming_order = {a: 0 for a in self.possible_agents}
         return {a: self._build_obs(a) for a in self.agents}, {a: {} for a in self.agents}
 
     def get_global_state(self):
-        global_state = []
-        for a in self.agents: 
-            global_state.extend(self._build_obs(a))
-        return np.array(global_state, dtype=np.float32)
+        state = []
+        for a in self.possible_agents:
+            state.extend([self.inventory[a], self.backlog[a], self.unfulfilled_orders[a]])
+            for t in range(1, self.lookahead + 1):
+                state.append(self.shipment_pipelines[a].pipeline.get(self.current_step + t, 0))
+        return np.array(state, dtype=np.float32)
+
+    def _roll_stochastic_demand(self, step):
+        d_type = self._config.get("demand_type")
+        if d_type == "black_swan": return self.np_random.poisson(8 if step < 25 else 20)
+        if d_type == "extreme_chaos":
+            base = 8 if step < 10 else 30 if step < 20 else 0 if step < 30 else self.np_random.integers(5, 25)
+            return self.np_random.poisson(base) if base > 0 else 0
+        return self.np_random.poisson(8)
+
+    def _peek_incoming_demand(self, agent, target_step):
+        if agent == "retailer":
+            d_type = self._config.get("demand_type")
+            if d_type == "step": return 4 if target_step < 5 else 8
+            if d_type == "zero": return 0
+            if target_step not in self.stochastic_demand_cache:
+                raise RuntimeError(f"Demand cache miss for step {target_step}. Observer effect detected.")
+            return self.stochastic_demand_cache[target_step]
+        idx = self.possible_agents.index(agent)
+        return self.order_pipelines[self.possible_agents[idx - 1]].pipeline.get(target_step, 0)
 
     def _build_obs(self, agent):
-        # FIX (Test 18): Pure local observation. No telepathic lookup of supplier backlogs.
-        obs = [float(self.inventory[agent]), float(self.backlog[agent]), float(self.unfulfilled_orders[agent])]
-        
+        next_inc = self._peek_incoming_demand(agent, self.current_step + 1)
+        obs = [float(self.inventory[agent]), float(self.backlog[agent]), float(self.unfulfilled_orders[agent]), float(next_inc)]
         for t in range(1, self.lookahead + 1):
             obs.append(float(self.shipment_pipelines[agent].pipeline.get(self.current_step + t, 0)))
-            
-        obs_array = np.array(obs, dtype=np.float32)
-        return np.clip(obs_array, -2000.0, 2000.0)
+        return np.clip(np.array(obs, dtype=np.float32), -2000.0, 2000.0)
+
+    def _validate_actions(self, actions):
+        if set(actions.keys()) != set(self.agents):
+            raise ValueError(f"Action keys mismatch. Expected {self.agents}")
+        for agent in self.agents:
+            act = actions[agent]
+            if isinstance(act, str) or isinstance(act, bool) or isinstance(act, complex):
+                raise ValueError("Action must be a numeric array")
+            try:
+                act_array = np.array(act, dtype=float)
+            except Exception:
+                raise ValueError(f"Action for {agent} is not convertible to float.")
+            if act_array.dtype == bool or not np.issubdtype(act_array.dtype, np.number):
+                raise ValueError("Action array must contain purely numbers")
+            if act_array.shape != (1,):
+                raise ValueError(f"Action for {agent} must be shape (1,), got {act_array.shape}")
+            if not np.isfinite(act_array[0]):
+                raise ValueError(f"Action for {agent} must be finite")
 
     def step(self, actions):
+        if not self.agents:
+            raise RuntimeError("Environment stepped after done")
+            
+        self._validate_actions(actions)
+            
         self.current_step += 1
-        
         rewards, terminations, truncations, infos = {}, {}, {}, {}
         total_system_cost = 0.0
 
+        if self._config.get("demand_type") not in ["step", "zero"]:
+            self.stochastic_demand_cache[self.current_step + 1] = self._roll_stochastic_demand(self.current_step + 1)
+
         # --- PHASE 1: RECEIVE INCOMING GOODS ---
-        for agent in self.agents:
+        for agent in self.possible_agents:
             received = self.shipment_pipelines[agent].receive_shipment(self.current_step)
             self.inventory[agent] += received
-            # FIX (Test 18): Deduct received goods from the POMDP ledger
             self.unfulfilled_orders[agent] -= received
 
         # --- PHASE 2: DETERMINE & FULFILL DEMAND ---
-        demand_type = self.config.get("demand_type", "step")
-        for i, agent in enumerate(self.agents):
+        for i, agent in enumerate(self.possible_agents):
             if agent == "retailer":
-                if demand_type == "step":
-                    # FIX (Test 20): Shift shock to t>5 to allow baseline verification
-                    current_demand = 4 if self.current_step <= 5 else 8
-                elif demand_type == "black_swan":
-                    base_demand = 8 if self.current_step < 25 else 20
-                    current_demand = np.random.poisson(base_demand)
-                elif demand_type == "extreme_chaos":
-                    if self.current_step < 10: base_demand = 8
-                    elif self.current_step < 20: base_demand = 30
-                    elif self.current_step < 30: base_demand = 0   
-                    else: base_demand = np.random.randint(5, 25)
-                    current_demand = np.random.poisson(base_demand) if base_demand > 0 else 0
-                elif demand_type == "zero":
-                    current_demand = 0
-                else:
-                    current_demand = np.random.poisson(8)
+                current_demand = self._peek_incoming_demand(agent, self.current_step)
             else:
-                current_demand = self.order_pipelines[self.agents[i - 1]].receive_shipment(self.current_step)
+                current_demand = self.order_pipelines[self.possible_agents[i - 1]].receive_shipment(self.current_step)
+                
+            self.current_incoming_order[agent] = current_demand
             
+            if agent == "manufacturer":
+                requests = self.order_pipelines[agent].receive_shipment(self.current_step)
+                if requests > 0:
+                    self.shipment_pipelines[agent].add_shipment(self.current_step, requests, lead_time=2)
+
             total_req = current_demand + self.backlog[agent]
             fulfilled = min(self.inventory[agent], total_req)
             self.inventory[agent] -= fulfilled
             self.backlog[agent] = total_req - fulfilled
 
-            if agent != "retailer":
-                delay = np.random.randint(1, 10) if self.config.get("jittery_lead_time", False) else 2 
-                self.shipment_pipelines[self.agents[i - 1]].add_shipment(self.current_step, fulfilled, delay)
+            if agent != "retailer" and fulfilled > 0:
+                delay = self.np_random.integers(1, 10) if self._config.get("jittery_lead_time", False) else 2 
+                self.shipment_pipelines[self.possible_agents[i - 1]].add_shipment(self.current_step, fulfilled, delay)
 
-        # --- PHASE 3: PLACE ORDERS (Direct Action Control) ---
-        orders = {}
+        # --- PHASE 3: PLACE ORDERS ---
         for agent in self.agents:
-            raw_action = float(np.clip(actions[agent][0], 0.0, 1.0))
-            calculated_order = int(np.round(raw_action * self.max_order))
-            orders[agent] = calculated_order
+            raw_action = float(np.clip(np.array(actions[agent], dtype=float)[0], 0.0, 1.0))
+            order = int(np.floor(raw_action * self.max_order + 0.5))
             
-            # FIX (Test 18): Add new orders to the POMDP ledger
-            self.unfulfilled_orders[agent] += calculated_order
-            
-            if agent == "manufacturer":
-                self.shipment_pipelines[agent].add_shipment(self.current_step, orders[agent], lead_time=2)
-            else:
-                self.order_pipelines[agent].add_shipment(self.current_step, orders[agent], lead_time=2)
+            if self.current_step < self.horizon:
+                self.unfulfilled_orders[agent] += order
+                if order > 0:
+                    lead_time = 1 if agent == "manufacturer" else 2
+                    self.order_pipelines[agent].add_shipment(self.current_step, order, lead_time=lead_time)
 
         # --- PHASE 4: ACCOUNTING & REWARDS ---
         done = self.current_step >= self.horizon
-        alpha = self.config.get("reward_alpha", 0.5)
+        alpha = self._config.get("reward_alpha", 1.0) 
         
         for agent in self.agents:
-            agent_cost = (self.h * self.inventory[agent]) + (self.b * self.backlog[agent])
-            total_system_cost += agent_cost
-            infos[agent] = {"local_cost": agent_cost}
+            cost = (self.h * self.inventory[agent]) + (self.b * self.backlog[agent])
+            total_system_cost += cost
+            infos[agent] = {"local_cost": cost}
 
         for agent in self.agents:
-            local_penalty = infos[agent]["local_cost"]
-            rewards[agent] = -((1.0 - alpha) * local_penalty) - (alpha * total_system_cost)
-            
+            rewards[agent] = -((1.0 - alpha) * infos[agent]["local_cost"]) - (alpha * total_system_cost)
             terminations[agent] = False
             truncations[agent] = done
 
-        return {a: self._build_obs(a) for a in self.agents}, rewards, terminations, truncations, infos
+        obs_dict = {a: self._build_obs(a) for a in self.agents}
+        if done: self.agents = []
+
+        return obs_dict, rewards, terminations, truncations, infos
