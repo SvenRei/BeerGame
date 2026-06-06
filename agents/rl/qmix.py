@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from comm_utils import get_vocab_tensor
 
 class QMixLocalAgent(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_actions):
@@ -21,35 +22,23 @@ class QMixLocalAgent(nn.Module):
         return q_vals, h
 
 class CommQMixLocalAgent(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_actions, vocab_size=3, **kwargs):
+    def __init__(self, input_dim, hidden_dim, n_actions, vocab_size=3):
         super(CommQMixLocalAgent, self).__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         
-        # ENGINEER FIX: Dual-Stream Architecture
-        # Observations and Messages are encoded separately to prevent feature collision
-        stream_dim = hidden_dim // 2
-        self.obs_encoder = nn.Linear(input_dim, stream_dim)
-        self.msg_encoder = nn.Linear(1, stream_dim)
+        self.obs_encoder = nn.Linear(input_dim, hidden_dim // 2)
+        self.msg_encoder = nn.Linear(1, hidden_dim // 2)
         
-        # The GRU now takes the fused representation
         self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
         self.value_stream = nn.Linear(hidden_dim, 1)
         self.advantage_stream = nn.Linear(hidden_dim, n_actions)
         self.msg_stream = nn.Linear(hidden_dim, vocab_size)
 
-    def get_vocab_tensor(self, device):
-        if self.vocab_size == 1: return torch.tensor([0.0], device=device)
-        elif self.vocab_size == 3: return torch.tensor([-1.0, 0.0, 1.0], device=device)
-        elif self.vocab_size == 5: return torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=device)
-        else: raise ValueError("Vocab size must be 1, 3, or 5")
-
     def forward(self, obs, msg_in, hidden, tau=1.0):
-        # Process streams separately
         obs_feat = F.relu(self.obs_encoder(obs))
         msg_feat = F.relu(self.msg_encoder(msg_in))
         
-        # Fuse them before the GRU
         x = torch.cat([obs_feat, msg_feat], dim=-1)
         h_in = hidden.reshape(-1, self.hidden_dim)
         h = self.rnn(x, h_in)
@@ -62,9 +51,12 @@ class CommQMixLocalAgent(nn.Module):
             msg_out = torch.zeros(h.size(0), 1, device=obs.device)
         else:
             msg_logits = self.msg_stream(h)
+            # Differentiable comm using Gumbel-Softmax
             msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=True)
-            vocab = self.get_vocab_tensor(obs.device)
+            vocab = get_vocab_tensor(self.vocab_size, obs.device)
             msg_out = (msg_probs * vocab).sum(dim=-1, keepdim=True)
+        
+        return q_vals, msg_out, h
         
         return q_vals, msg_out, h
 

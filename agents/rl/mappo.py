@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal, Categorical
 import numpy as np
+from comm_utils import get_vocab_tensor
 
 class RolloutBuffer:
     def __init__(self):
@@ -41,6 +42,7 @@ class MAPPOActor(nn.Module):
 class CommMAPPOActor(nn.Module):
     def __init__(self, obs_dim, hidden_dim, vocab_size=3, comm_dim=1):
         super().__init__()
+        self.vocab_size = vocab_size
         self.fc = nn.Sequential(
             nn.Linear(obs_dim + comm_dim, hidden_dim), nn.ReLU(), 
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU()
@@ -53,7 +55,7 @@ class CommMAPPOActor(nn.Module):
         nn.init.orthogonal_(self.action_mean.weight, gain=0.01)
         nn.init.constant_(self.action_mean.bias, -0.75)
 
-    def forward(self, obs, comm_in, hidden):
+    def forward(self, obs, comm_in, hidden, tau=1.0):
         x = torch.cat([obs, comm_in], dim=-1)
         x = self.fc(x).unsqueeze(0)
         hidden = hidden.unsqueeze(0)
@@ -65,10 +67,14 @@ class CommMAPPOActor(nn.Module):
         mean = torch.sigmoid(self.action_mean(x_flat))
         std = self.action_log_std.exp().expand_as(mean)
         
-        logits = self.comm_head(x_flat)
-        dist_comm = Categorical(logits=logits)
+        # Use Gumbel-Softmax for differentiable communication
+        msg_logits = self.comm_head(x_flat)
+        # We need the underlying categorical for the PPO ratio calculation
+        dist_comm = Categorical(logits=msg_logits)
+        # We sample via Gumbel for the differentiable forward pass
+        msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=True)
         
-        return Normal(mean, std), dist_comm, hidden
+        return Normal(mean, std), dist_comm, msg_probs, hidden
 
 class MAPPOCommMAC(nn.Module):
     def __init__(self, actor_network, vocab_size=3, num_agents=4):
@@ -94,7 +100,7 @@ class MAPPOCommMAC(nn.Module):
     def init_buffer(self, batch_size, device):
         self.msg_buffer = torch.zeros(batch_size, self.num_agents, 1, device=device)
 
-    def forward(self, obs, hiddens, test_mode=False):
+    def forward(self, obs, hiddens, tau=1.0, test_mode=False):
         B = obs.size(0)
         vocab_tensor = self.get_vocab_tensor(obs.device)
         
@@ -104,7 +110,9 @@ class MAPPOCommMAC(nn.Module):
         msg_flat = masked_msgs.view(B * self.num_agents, -1)
         hiddens_flat = hiddens.view(B * self.num_agents, -1)
         
-        dist_action, dist_comm, next_hiddens = self.actor(obs_flat, msg_flat, hiddens_flat)
+        dist_action, dist_comm, msg_probs, next_hiddens = self.actor(obs_flat, msg_flat, hiddens_flat, tau=tau)
+        vocab_tensor = get_vocab_tensor(self.vocab_size, obs.device)
+        comm_out = (msg_probs * vocab_tensor).sum(dim=-1, keepdim=True)
         
         if test_mode:
             comm_actions = dist_comm.probs.argmax(dim=-1)
