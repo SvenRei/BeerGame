@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal, Categorical
 import numpy as np
-from comm_utils import get_vocab_tensor
+from .comm_utils import get_vocab_tensor
+import torch.nn.functional as F
 
 class RolloutBuffer:
     def __init__(self):
@@ -13,6 +14,17 @@ class RolloutBuffer:
         self.comm_in, self.actions, self.log_probs = [], [], []
         self.comm_actions = [] 
         self.rewards, self.is_terminals = [], []
+
+    def push(self, obs, g_state, hidden, comm_in, action, log_prob, comm_action, reward, terminal):
+        self.local_obs.append(obs)           # Expected [4, obs_dim]
+        self.global_states.append(g_state)   # Expected [1, global_dim]
+        self.hidden_states.append(hidden)    # Expected [4, hidden_dim]
+        self.comm_in.append(comm_in)         # Expected [4, 1]
+        self.actions.append(action)          # Expected [4, 1]
+        self.log_probs.append(log_prob)      # Expected [4, 1]
+        self.comm_actions.append(comm_action)# Expected [4, 1]
+        self.rewards.append(reward)          # Expected [4, 1]
+        self.is_terminals.append(terminal)   # Expected [4, 1]
 
 class MAPPOActor(nn.Module):
     def __init__(self, obs_dim, hidden_dim):
@@ -39,24 +51,53 @@ class MAPPOActor(nn.Module):
         std = self.action_log_std.exp().expand_as(mean)
         return Normal(mean, std), hidden
 
+    def evaluate_actions(self, obs_seq, hidden_0, action_seq):
+        """
+        ENGINEER FIX: Recurrent Unrolling for BPTT.
+        Evaluates an entire sequence (T, Num_Agents, Dim) to maintain gradient memory.
+        """
+        x = self.fc(obs_seq)
+        x, _ = self.gru(x, hidden_0) # Gradients flow through time T here
+        
+        mean = torch.sigmoid(self.action_mean(x))
+        std = self.action_log_std.exp().expand_as(mean)
+        dist = Normal(mean, std)
+        
+        action_log_probs = dist.log_prob(action_seq)
+        return action_log_probs, dist.entropy().mean()
+
 class CommMAPPOActor(nn.Module):
-    def __init__(self, obs_dim, hidden_dim, vocab_size=3, comm_dim=1):
+    def __init__(self, obs_dim, hidden_dim, vocab_size): 
         super().__init__()
-        self.vocab_size = vocab_size
+        
+        self.vocab_size = vocab_size # Save this to use in forward/evaluate
+        comm_dim = vocab_size 
+        
         self.fc = nn.Sequential(
-            nn.Linear(obs_dim + comm_dim, hidden_dim), nn.ReLU(), 
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU()
+            nn.Linear(obs_dim + comm_dim, hidden_dim), # Expects 8 + 3 = 11
+            nn.ReLU(),
         )
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=False)
         self.action_mean = nn.Linear(hidden_dim, 1)
         self.action_log_std = nn.Parameter(torch.full((1, 1), -1.0)) 
-        self.comm_head = nn.Linear(hidden_dim, vocab_size)
+        
+        self.comm_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, vocab_size) 
+        )
 
         nn.init.orthogonal_(self.action_mean.weight, gain=0.01)
         nn.init.constant_(self.action_mean.bias, -0.75)
 
     def forward(self, obs, comm_in, hidden, tau=1.0):
-        x = torch.cat([obs, comm_in], dim=-1)
+        # 1. ENGINEER FIX: Convert index (size 1) to one-hot (size 3) BEFORE passing to FC
+        comm_in_idx = comm_in.long().squeeze(-1) # Remove the trailing dimension
+        comm_one_hot = F.one_hot(comm_in_idx, num_classes=self.vocab_size).float() 
+        
+        # 2. Concatenate obs (8) + one_hot (3) = 11
+        x = torch.cat([obs, comm_one_hot], dim=-1)
+        
         x = self.fc(x).unsqueeze(0)
         hidden = hidden.unsqueeze(0)
         x, hidden = self.gru(x, hidden)
@@ -67,14 +108,42 @@ class CommMAPPOActor(nn.Module):
         mean = torch.sigmoid(self.action_mean(x_flat))
         std = self.action_log_std.exp().expand_as(mean)
         
-        # Use Gumbel-Softmax for differentiable communication
         msg_logits = self.comm_head(x_flat)
-        # We need the underlying categorical for the PPO ratio calculation
         dist_comm = Categorical(logits=msg_logits)
-        # We sample via Gumbel for the differentiable forward pass
         msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=True)
         
         return Normal(mean, std), dist_comm, msg_probs, hidden
+
+    def evaluate_actions(self, obs_seq, comm_in_seq, hidden_0, action_seq, comm_action_seq):
+        """
+        ENGINEER FIX: Apply the same one-hot encoding to the batch sequence
+        """
+        # comm_in_seq shape is [T, Num_Agents, 1]. Squeeze it to [T, Num_Agents]
+        comm_in_idx = comm_in_seq.long().squeeze(-1)
+        comm_one_hot = F.one_hot(comm_in_idx, num_classes=self.vocab_size).float()
+        
+        # Concatenate properly
+        x = torch.cat([obs_seq, comm_one_hot], dim=-1)
+        
+        x = self.fc(x)
+        x, _ = self.gru(x, hidden_0) # Unrolls through time T
+        
+        mean = torch.sigmoid(self.action_mean(x))
+        std = self.action_log_std.exp().expand_as(mean)
+        dist_action = Normal(mean, std)
+        
+        msg_logits = self.comm_head(x)
+        dist_comm = Categorical(logits=msg_logits)
+        
+        action_log_probs = dist_action.log_prob(action_seq)
+        comm_log_probs = dist_comm.log_prob(comm_action_seq.squeeze(-1))
+        
+        entropy = dist_action.entropy().mean() + dist_comm.entropy().mean()
+
+        print(f"DEBUG: Max-Min Logits: {msg_logits.max() - msg_logits.min():.4f}")
+        print(f"DEBUG: Logits Mean: {msg_logits.mean():.4f}")
+        
+        return action_log_probs, comm_log_probs, dist_comm.probs, entropy
 
 class MAPPOCommMAC(nn.Module):
     def __init__(self, actor_network, vocab_size=3, num_agents=4):
@@ -91,18 +160,12 @@ class MAPPOCommMAC(nn.Module):
         ]))
         self.msg_buffer = None
 
-    def get_vocab_tensor(self, device):
-        if self.vocab_size == 1: return torch.tensor([0.0], device=device)
-        elif self.vocab_size == 3: return torch.tensor([-1.0, 0.0, 1.0], device=device)
-        elif self.vocab_size == 5: return torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=device)
-        else: raise ValueError("Vocab size must be 1, 3, or 5")
-
     def init_buffer(self, batch_size, device):
         self.msg_buffer = torch.zeros(batch_size, self.num_agents, 1, device=device)
 
     def forward(self, obs, hiddens, tau=1.0, test_mode=False):
         B = obs.size(0)
-        vocab_tensor = self.get_vocab_tensor(obs.device)
+        vocab_tensor = get_vocab_tensor(self.vocab_size, obs.device)
         
         masked_msgs = torch.matmul(self.adj_mask, self.msg_buffer)
         
@@ -147,68 +210,89 @@ class MAPPOTrainer:
         self.warm_up_episodes = cfg.get("warm_up_episodes", 1000)
         self.total_episodes = total_episodes 
         
+        # ENGINEER FIX: Annealing schedule parameters
+        self.tau_start = 1.0
+        self.tau_min = 0.1
+        self.tau_decay_episodes = cfg.get("tau_decay_episodes", total_episodes * 0.5)
+        
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.get("lr_actor", 3e-4))
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=cfg.get("lr_critic", 1e-3))
         self.max_grad_norm = 0.2 
 
+    def get_current_tau(self, current_ep):
+        """Calculates the annealed Gumbel-Softmax temperature."""
+        if current_ep >= self.tau_decay_episodes:
+            return self.tau_min
+        return self.tau_start - (self.tau_start - self.tau_min) * (current_ep / self.tau_decay_episodes)
+
     def update(self, buffer, current_ep):
-        obs = torch.cat(buffer.local_obs).detach()
-        # FIX: Removed the invalid .transpose(0, 1) so it safely enters the GRU loop
-        hiddens = torch.cat(buffer.hidden_states).detach()
-        actions = torch.cat(buffer.actions).detach()
-        old_log_probs = torch.cat(buffer.log_probs).detach()
-        
         num_agents = 4
-        returns = [0.0] * len(buffer.rewards)
-        for i in reversed(range(len(buffer.rewards))):
-            r = buffer.rewards[i]
-            term = buffer.is_terminals[i]
-            next_discounted = returns[i + num_agents] if i + num_agents < len(buffer.rewards) else 0.0
-            returns[i] = r + (self.gamma * next_discounted * (1 - term))
-            
-        returns = torch.tensor(returns, dtype=torch.float32).to(self.device).unsqueeze(1)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         
+        # 1. STACK & DEFINE
+        obs_seq = torch.stack(buffer.local_obs).detach()
+        T = obs_seq.size(0)
+        
+        actions_seq = torch.stack(buffer.actions).detach()
+        old_log_probs_seq = torch.stack(buffer.log_probs).detach()
+        rewards_seq = torch.stack(buffer.rewards).detach()
+        terminals_seq = torch.stack(buffer.is_terminals).detach()
+        
+        # FIX: Add .unsqueeze(0) here to create the [num_layers, batch, hidden] shape
+        hidden_0 = torch.stack(buffer.hidden_states)[0].unsqueeze(0).detach()
+        
+        # Global states logic (Unified)
+        g_states_raw = torch.stack(buffer.global_states).detach() # [T, 1, global_dim]
+        g_states_seq = g_states_raw.repeat(1, num_agents, 1)      # [T, 4, global_dim]
+
+        # 2. VECTORIZED RETURNS CALCULATION
+        returns = torch.zeros_like(rewards_seq)
+        next_return = 0.0
+        for t in reversed(range(T)):
+            next_return = rewards_seq[t] + self.gamma * next_return * (1.0 - terminals_seq[t])
+            returns[t] = next_return
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+        # 3. PRE-CALCULATE ADVANTAGES
+        if self.algo == "ippo":
+            values_flat = self.critic(obs_seq.reshape(T * num_agents, -1))
+        else:
+            values_flat = self.critic(g_states_seq.reshape(T * num_agents, -1))
+        
+        values_seq = values_flat.view(T, num_agents, 1)
+        advantages_seq = returns - values_seq.detach()
+
+        # 4. EPOCH LOOP (Uses pre-calculated sequences, no re-stacking)
         for _ in range(self.k_epochs):
-            if self.algo == "ippo":
-                values = self.critic(obs)
-            else:
-                values = self.critic(torch.cat(buffer.global_states).detach())
-            
-            advantages = returns - values.detach()
-            
             if self.algo == "comm_mappo":
-                base_actor = self.actor.actor
-                dist, dist_comm, _ = base_actor(obs, torch.cat(buffer.comm_in).detach(), hiddens)
-                comm_actions = torch.cat(buffer.comm_actions).detach()
+                comm_in_seq = torch.stack(buffer.comm_in).detach()
+                comm_actions_seq = torch.stack(buffer.comm_actions).detach()
                 
-                current_log_probs = dist.log_prob(actions) + dist_comm.log_prob(comm_actions).unsqueeze(-1)
-                ratios = torch.exp(current_log_probs - old_log_probs)
-                
-                out_features = base_actor.comm_head.out_features
-                if out_features > 1:
-                    silence_idx = out_features // 2
-                    prob_speak = 1.0 - dist_comm.probs[:, silence_idx]
-                    comm_penalty = torch.mean(prob_speak)
-                else:
-                    comm_penalty = 0.0
-                    
-                entropy = dist.entropy().mean() + dist_comm.entropy().mean()
+                # Unroll comm-mappo
+                act_log_probs, comm_log_probs, comm_dist_probs, entropy = self.actor.actor.evaluate_actions(
+                    obs_seq, comm_in_seq, hidden_0, actions_seq, comm_actions_seq
+                )
+                current_log_probs_seq = act_log_probs + comm_log_probs.unsqueeze(-1)
+                comm_penalty = 0.0 # (Or your comm penalty logic)
             else:
-                dist, _ = self.actor(obs, hiddens)
-                ratios = torch.exp(dist.log_prob(actions) - old_log_probs)
+                # Basic unrolling
+                act_log_probs, entropy = self.actor.evaluate_actions(obs_seq, hidden_0, actions_seq)
+                current_log_probs_seq = act_log_probs
                 comm_penalty = 0.0
-                entropy = dist.entropy().mean()
-            
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
+
+            ratios = torch.exp(current_log_probs_seq - old_log_probs_seq)
+            surr1 = ratios * advantages_seq
+            surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages_seq
             actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+
+            # Critic Loss
+            if self.algo == "ippo":
+                values_flat = self.critic(obs_seq.reshape(T * num_agents, -1))
+            else:
+                values_flat = self.critic(g_states_seq.reshape(T * num_agents, -1))
             
-            if self.algo == "comm_mappo" and current_ep > self.warm_up_episodes:
-                actor_loss = actor_loss + (self.comm_penalty_coef * comm_penalty)
+            critic_loss = torch.nn.MSELoss()(values_flat, returns.reshape(T * num_agents, 1))
 
-            critic_loss = nn.MSELoss()(values, returns)
-
+            # Optimizer steps
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)

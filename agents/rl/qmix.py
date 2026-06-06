@@ -27,12 +27,17 @@ class CommQMixLocalAgent(nn.Module):
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         
+        # Dual-stream encoder for clean feature separation
         self.obs_encoder = nn.Linear(input_dim, hidden_dim // 2)
         self.msg_encoder = nn.Linear(1, hidden_dim // 2)
         
         self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
+        
+        # Dueling streams
         self.value_stream = nn.Linear(hidden_dim, 1)
         self.advantage_stream = nn.Linear(hidden_dim, n_actions)
+        
+        # Communication stream
         self.msg_stream = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, obs, msg_in, hidden, tau=1.0):
@@ -51,13 +56,12 @@ class CommQMixLocalAgent(nn.Module):
             msg_out = torch.zeros(h.size(0), 1, device=obs.device)
         else:
             msg_logits = self.msg_stream(h)
-            # Differentiable comm using Gumbel-Softmax
+            # Differentiable comm using Gumbel-Softmax (Matches MAPPO exactly)
             msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=True)
             vocab = get_vocab_tensor(self.vocab_size, obs.device)
             msg_out = (msg_probs * vocab).sum(dim=-1, keepdim=True)
         
-        return q_vals, msg_out, h
-        
+        # FIX: Removed the duplicate return statement
         return q_vals, msg_out, h
 
 class QMixCommMAC(nn.Module):
@@ -66,6 +70,7 @@ class QMixCommMAC(nn.Module):
         self.agent = agent_network
         self.num_agents = num_agents
         
+        # Standard Supply Chain Chain-Graph Adjacency Mask
         self.register_buffer("adj_mask", torch.tensor([
             [0.0, 1.0, 0.0, 0.0],
             [1.0, 0.0, 1.0, 0.0],
@@ -99,6 +104,7 @@ class QMixCommMAC(nn.Module):
         msg_flat = masked_msgs.view(B * self.num_agents, -1)
         hiddens_flat = hiddens.view(B * self.num_agents, -1)
         
+        # Passes the annealed tau into the agent
         q_vals, msg_out, next_hiddens = self.agent(obs_flat, msg_flat, hiddens_flat, tau=tau)
         
         msg_out_reshaped = msg_out.view(B, self.num_agents, 1)

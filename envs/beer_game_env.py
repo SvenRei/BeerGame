@@ -68,7 +68,7 @@ class BeerGameParallelEnv(ParallelEnv):
         demand_type = self._config.get("demand_type", None)
         if demand_type is None:
             demand_type = "step"
-        valid_demands = ["step", "zero", "black_swan", "extreme_chaos"]
+        valid_demands = ["step", "zero", "black_swan", "extreme_chaos", "poisson"]
         if demand_type not in valid_demands:
             raise ValueError(f"Invalid demand_type: {demand_type}")
         self._config["demand_type"] = demand_type

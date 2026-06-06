@@ -9,12 +9,19 @@ from agents.rl.mappo import MAPPOActor, CommMAPPOActor, MAPPOCommMAC, MAPPOCriti
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
+    # Initialize W&B
     run = wandb.init(project="BeerGame_Research", config=dict(cfg), name=cfg.agent.algorithm)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 1. Environment Initialization
     cfg.env.demand_type = "poisson"
     env = BeerGameParallelEnv(cfg.env)
     algo = cfg.agent.algorithm.lower()
     
+    # 2. Reset env IMMEDIATELY to populate state for dimension calculations
+    obs, _ = env.reset(seed=1000)
+    
+    # 3. Parameter setup after algo definition
     if "lr_actor" in wandb.config: cfg.agent.lr_actor = wandb.config.get("lr_actor")
     if "lr_critic" in wandb.config: cfg.agent.lr_critic = wandb.config.get("lr_critic")
     if "k_epochs" in wandb.config: cfg.agent.k_epochs = wandb.config.get("k_epochs")
@@ -27,8 +34,10 @@ def main(cfg: DictConfig):
     os.makedirs(run_dir, exist_ok=True)
     
     local_dim = env.observation_space("retailer").shape[0]
-    critic_in = local_dim if algo == "ippo" else local_dim * len(env.agents)
+    dummy_global = env.get_global_state()
+    critic_in = local_dim if algo == "ippo" else len(dummy_global)
     
+    # Network Initialization
     if algo == "comm_mappo":
         vocab_size = cfg.agent.get("vocab_size", 3)
         base_actor = CommMAPPOActor(local_dim, cfg.agent.hidden_dim, vocab_size=vocab_size).to(device)
@@ -63,63 +72,66 @@ def main(cfg: DictConfig):
         ep_agent_costs = {a: 0.0 for a in env.agents}
         episode_messages = []
         
+        current_tau = trainer.get_current_tau(ep) if algo == "comm_mappo" else 1.0
+        
         while True:
-            obs_array = np.stack([obs[a] for a in env.agents])
+            # 1. Inference
+            obs_array = np.stack([obs[a] for a in env.agents]) # [4, local_dim]
             obs_tensor = torch.tensor(obs_array, dtype=torch.float32).unsqueeze(0).to(device)
-            state = np.concatenate([obs[a] for a in sorted(env.agents)])
+            state = env.get_global_state() # [global_dim]
+            
+            # CRITICAL: Standardize the global state shape to [1, global_dim]
+            state_tensor = torch.tensor(state, dtype=torch.float32).view(1, -1).to(device).detach()
             
             with torch.no_grad():
                 if algo == "comm_mappo":
-                    dist_action, dist_comm, comm_actions_raw, next_hiddens, masked_msg_in, safe_logs = actor(obs_tensor, hiddens_tensor)
+                    dist_action, dist_comm, comm_actions_raw, next_hiddens, masked_msg_in, safe_logs = actor(
+                        obs_tensor, hiddens_tensor, tau=current_tau
+                    )
                     actions_raw = dist_action.sample()
-                    
                     actions_val = actions_raw.view(1, len(env.agents), 1)
                     comm_actions = comm_actions_raw.view(1, len(env.agents))
                     episode_messages.append(safe_logs)
+                    msg_in_buffer = masked_msg_in.squeeze(0)
+                    comm_acts_buffer = comm_actions.squeeze(0).unsqueeze(-1)
+                    log_probs_val = dist_action.log_prob(actions_raw).view(1, len(env.agents), 1) + \
+                                    dist_comm.log_prob(comm_actions_raw).view(1, len(env.agents), 1)
                 else:
                     dist_action, next_hiddens_raw = actor(obs_tensor.view(-1, local_dim), hiddens_tensor.view(-1, cfg.agent.hidden_dim))
                     actions_raw = dist_action.sample()
-                    
                     actions_val = actions_raw.view(1, len(env.agents), 1)
                     next_hiddens = next_hiddens_raw.view(1, len(env.agents), -1)
+                    log_probs_val = dist_action.log_prob(actions_raw).view(1, len(env.agents), 1)
+                    msg_in_buffer = None
+                    comm_acts_buffer = None
             
-            acts = {a: [actions_val[0, i].cpu().item()] for i, a in enumerate(env.agents)}
+            acts = {a: [actions_val[0, i, 0].cpu().item()] for i, a in enumerate(env.agents)}
             
-            # THE FIX: ALL Buffer Appends Must Occur Inside This Loop
-            for i, a in enumerate(env.agents):
-                buffer.local_obs.append(obs_tensor[0, i].unsqueeze(0))
-                buffer.hidden_states.append(hiddens_tensor[0, i].unsqueeze(0))
-                buffer.actions.append(actions_val[0, i].unsqueeze(0))
-                
-                if algo == "comm_mappo":
-                    buffer.comm_in.append(masked_msg_in[0, i].unsqueeze(0))
-                    buffer.comm_actions.append(comm_actions[0, i].view(1))
-                    
-                    lp_act = dist_action.log_prob(actions_raw)[i]
-                    lp_comm = dist_comm.log_prob(comm_actions_raw)[i].view(1)
-                    buffer.log_probs.append((lp_act + lp_comm).view(1, 1))
-                else:
-                    lp_act = dist_action.log_prob(actions_raw)[i].view(1, 1)
-                    buffer.log_probs.append(lp_act)
-
-                # FIX: Align global_states to 200 elements by appending inside the agent loop
-                buffer.global_states.append(torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device))
-
-            hiddens_tensor = next_hiddens
-            
+            # 2. Step Env
             next_obs, rewards, terms, truncs, infos = env.step(acts)
+            ep_cost += sum(infos[a]["local_cost"] for a in env.agents)
             
-            true_step_cost = sum(infos[a]["local_cost"] for a in env.agents)
-            ep_cost += true_step_cost
-            
-            for i, a in enumerate(env.agents): 
-                local_cost = infos.get(a, {}).get("local_cost", 0.0)
-                ep_agent_costs[a] += local_cost 
-                raw_cost = abs(local_cost) if algo == "ippo" else abs(rewards[a])
-                scaled_reward = -raw_cost / 100.0 
-                buffer.rewards.append(scaled_reward)
-                buffer.is_terminals.append(terms[a])
-                
+            # 3. Create Contract-Compliant Tensors
+            r_tensor = torch.zeros(len(env.possible_agents), 1, device=device)
+            t_tensor = torch.zeros(len(env.possible_agents), 1, device=device)
+            for i, a in enumerate(env.possible_agents):
+                r_tensor[i] = -abs(rewards.get(a, 0.0)) / 100.0
+                t_tensor[i] = float(terms.get(a, False))
+
+            # 4. PUSH ALL (Using the standardized state_tensor)
+            buffer.push(
+                obs=obs_tensor.squeeze(0).detach(),
+                g_state=state_tensor, # Standardized to [1, global_dim]
+                hidden=hiddens_tensor.squeeze(0).detach(),
+                comm_in=msg_in_buffer.detach() if msg_in_buffer is not None else torch.zeros(len(env.agents), 1, device=device),
+                action=actions_val.squeeze(0).detach(),
+                log_prob=log_probs_val.squeeze(0).detach(),
+                comm_action=comm_acts_buffer.detach() if comm_acts_buffer is not None else torch.zeros(len(env.agents), 1, device=device),
+                reward=r_tensor,
+                terminal=t_tensor
+            )
+
+            hiddens_tensor = next_hiddens.detach()
             obs = next_obs
             if any(terms.values()) or any(truncs.values()): break
             
@@ -127,15 +139,21 @@ def main(cfg: DictConfig):
         actor_scheduler.step()
         critic_scheduler.step()
         
-        log_dict = {"Cost": ep_cost, "Actor_Loss": actor_loss, "Critic_Loss": critic_loss, "Actor_LR": actor_scheduler.get_last_lr()[0]}
+        # Log to W&B
+        log_dict = {
+            "Cost": ep_cost, 
+            "Actor_Loss": actor_loss, 
+            "Critic_Loss": critic_loss, 
+            "Actor_LR": actor_scheduler.get_last_lr()[0],
+            "Tau": current_tau if algo == "comm_mappo" else 0.0
+        }
         for a, cost in ep_agent_costs.items(): log_dict[f"Cost/{a}"] = cost
         wandb.log(log_dict)
         
         cost_history.append(ep_cost)
         avg_cost = sum(cost_history) / len(cost_history)
         
-        if ep == warm_up: 
-            best_avg_cost, since_imp = float('inf'), 0
+        if ep == warm_up: best_avg_cost, since_imp = float('inf'), 0
             
         if avg_cost < best_avg_cost and len(cost_history) == 50: 
             best_avg_cost = avg_cost

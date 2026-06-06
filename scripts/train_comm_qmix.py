@@ -9,11 +9,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer
 
-# ENGINEER FIX: ReplayBuffer now stores BOTH hidden and next_hidden to preserve temporal alignment
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
-    # Added next_hidden to the push signature
     def push(self, state, obs, acts, reward, next_state, next_obs, done, hidden, next_hidden):
         self.buffer.append((state, obs, acts, reward, next_state, next_obs, done, hidden, next_hidden))
     def sample(self, batch_size):
@@ -37,7 +35,12 @@ def main(cfg: DictConfig):
     os.makedirs(run_dir, exist_ok=True)
     
     local_dim = env.observation_space("retailer").shape[0]
-    state_dim = local_dim * len(env.agents)
+    
+    # ENGINEER FIX: CTDE State size sync
+    # Use the actual length of the new unclipped global state
+    dummy_global = env.get_global_state()
+    state_dim = len(dummy_global)
+    
     n_actions = cfg.agent.n_actions 
     hidden_dim = cfg.agent.hidden_dim
     
@@ -63,11 +66,20 @@ def main(cfg: DictConfig):
     eps_decay_eps = cfg.agent.get("epsilon_decay_episodes", 5000)
     cost_history = deque(maxlen=50)
     best_avg_cost, global_step, epsilon = float('inf'), 0, cfg.agent.epsilon_start
+    
+    # ENGINEER FIX: MAPPO-Identical Tau Schedule
+    tau_start = 1.0
+    tau_min = 0.1
+    tau_decay_episodes = cfg.total_episodes * 0.5
 
     print(f"--- Starting COMM_QMIX Training Marathon ---")
 
     for ep in range(cfg.total_episodes):
-        tau = max(0.05, 5.0 * (1.0 - ep / cfg.total_episodes))
+        # IDENTICAL TAU SCHEDULE TO MAPPO
+        if ep >= tau_decay_episodes:
+            tau = tau_min
+        else:
+            tau = tau_start - (tau_start - tau_min) * (ep / tau_decay_episodes)
         
         obs, _ = env.reset(seed=1000 + ep)
         mac.init_buffer(batch_size=1, device=device)
@@ -79,10 +91,13 @@ def main(cfg: DictConfig):
         while True:
             obs_array = np.stack([obs[a] for a in env.agents])
             obs_tensor = torch.tensor(obs_array, dtype=torch.float32).unsqueeze(0).to(device)
-            state = np.concatenate([obs[a] for a in sorted(env.agents)])
+            
+            # ENGINEER FIX: Fetch true global state
+            state = env.get_global_state()
             
             with torch.no_grad():
-                q_vals, next_hiddens, safe_logs = mac(obs_tensor, hiddens_tensor, tau=tau)
+                # ENGINEER FIX: Ensure hiddens_tensor does not retain graph memory
+                q_vals, next_hiddens, safe_logs = mac(obs_tensor, hiddens_tensor.detach(), tau=tau)
                 episode_messages.append(safe_logs)
                 
             acts, env_acts = {}, {}
@@ -96,25 +111,37 @@ def main(cfg: DictConfig):
                 
                 acts[a] = action_idx
                 actions_list.append(action_idx)
+                
+                # FAIR BENCHMARK FIX:
+                # If n_actions=101, an index of 50 becomes 50 / 100 = 0.5.
+                # The env will multiply 0.5 * max_order (100) to get 50.
                 env_acts[a] = [action_idx / (n_actions - 1)]
                 
             next_obs, rewards, terms, truncs, infos = env.step(env_acts)
             raw_cost = sum(infos[a]["local_cost"] for a in env.agents)
             ep_cost += raw_cost
-            # ENGINEER FIX: Log-scale the reward to prevent Q-value gradient explosion
-            # np.log1p(x) safely calculates log(1 + x), compressing 80,000 down to a safe -11.2 penalty
+            
             global_reward = -np.log1p(raw_cost)
 
-            next_state = np.concatenate([next_obs[a] for a in sorted(env.agents)])
+            next_state = env.get_global_state()
             next_obs_array = np.stack([next_obs[a] for a in env.agents])
             
             done = any(terms.values()) or any(truncs.values())
             
-            # ENGINEER FIX: Pushing BOTH current hiddens AND next hiddens
-            buffer.push(state, obs_array, actions_list, global_reward, next_state, next_obs_array, done, hiddens_tensor.detach().cpu().numpy(), next_hiddens.detach().cpu().numpy())
+            buffer.push(
+                state, 
+                obs_array, 
+                actions_list, 
+                global_reward, 
+                next_state, 
+                next_obs_array, 
+                done, 
+                hiddens_tensor.detach().cpu().numpy(), 
+                next_hiddens.detach().cpu().numpy()
+            )
             
             obs = next_obs
-            hiddens_tensor = next_hiddens
+            hiddens_tensor = next_hiddens.detach() # FIX: Prevent graph memory leak
             global_step += 1
             
             if len(buffer) > cfg.agent.batch_size:
@@ -128,19 +155,18 @@ def main(cfg: DictConfig):
                 b_next_obs = torch.tensor(np.array([b[5] for b in batch]), dtype=torch.float32).to(device)
                 b_dones = torch.tensor(np.array([b[6] for b in batch]), dtype=torch.float32).unsqueeze(1).to(device)
                 
-                # ENGINEER FIX: Extract BOTH hidden states
                 b_h = torch.tensor(np.array([b[7] for b in batch]), dtype=torch.float32).to(device)
                 b_next_h = torch.tensor(np.array([b[8] for b in batch]), dtype=torch.float32).to(device)
                 
                 mac.init_buffer(cfg.agent.batch_size, device)
                 target_mac.init_buffer(cfg.agent.batch_size, device)
                 
-                # Calculate current Q values using b_h
+                # Calculate current Q values
                 q_evals, _, _ = mac(b_obs, b_h, tau=tau)
                 chosen_q_evals = torch.gather(q_evals, dim=2, index=b_actions)
                 
                 with torch.no_grad():
-                    # ENGINEER FIX: Calculate Next Q values strictly using b_next_h
+                    # Calculate Next Q values
                     online_next_q, _, _ = mac(b_next_obs, b_next_h, tau=tau)
                     best_next_actions = online_next_q.argmax(dim=2, keepdim=True)
                     target_q, _, _ = target_mac(b_next_obs, b_next_h, tau=tau)
