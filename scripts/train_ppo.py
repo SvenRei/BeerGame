@@ -75,70 +75,98 @@ def main(cfg: DictConfig):
         current_tau = trainer.get_current_tau(ep) if algo == "comm_mappo" else 1.0
         
         while True:
-            # 1. Inference
-            obs_array = np.stack([obs[a] for a in env.agents]) # [4, local_dim]
-            obs_tensor = torch.tensor(obs_array, dtype=torch.float32).unsqueeze(0).to(device)
-            state = env.get_global_state() # [global_dim]
-            
-            # CRITICAL: Standardize the global state shape to [1, global_dim]
-            state_tensor = torch.tensor(state, dtype=torch.float32).view(1, -1).to(device).detach()
-            
-            with torch.no_grad():
-                if algo == "comm_mappo":
-                    dist_action, dist_comm, comm_actions_raw, next_hiddens, masked_msg_in, safe_logs = actor(
-                        obs_tensor, hiddens_tensor, tau=current_tau
-                    )
-                    actions_raw = dist_action.sample()
-                    actions_val = actions_raw.view(1, len(env.agents), 1)
-                    comm_actions = comm_actions_raw.view(1, len(env.agents))
-                    episode_messages.append(safe_logs)
-                    msg_in_buffer = masked_msg_in.squeeze(0)
-                    comm_acts_buffer = comm_actions.squeeze(0).unsqueeze(-1)
-                    log_probs_val = dist_action.log_prob(actions_raw).view(1, len(env.agents), 1) + \
-                                    dist_comm.log_prob(comm_actions_raw).view(1, len(env.agents), 1)
-                else:
-                    dist_action, next_hiddens_raw = actor(obs_tensor.view(-1, local_dim), hiddens_tensor.view(-1, cfg.agent.hidden_dim))
-                    actions_raw = dist_action.sample()
-                    actions_val = actions_raw.view(1, len(env.agents), 1)
-                    next_hiddens = next_hiddens_raw.view(1, len(env.agents), -1)
-                    log_probs_val = dist_action.log_prob(actions_raw).view(1, len(env.agents), 1)
-                    msg_in_buffer = None
-                    comm_acts_buffer = None
-            
-            acts = {a: [actions_val[0, i, 0].cpu().item()] for i, a in enumerate(env.agents)}
-            
-            # 2. Step Env
-            next_obs, rewards, terms, truncs, infos = env.step(acts)
-            ep_cost += sum(infos[a]["local_cost"] for a in env.agents)
-            
-            # 3. Create Contract-Compliant Tensors
-            r_tensor = torch.zeros(len(env.possible_agents), 1, device=device)
-            t_tensor = torch.zeros(len(env.possible_agents), 1, device=device)
-            for i, a in enumerate(env.possible_agents):
-                r_tensor[i] = -abs(rewards.get(a, 0.0)) / 100.0
-                t_tensor[i] = float(terms.get(a, False))
+                # 1. Inference
+                obs_array = np.stack([obs[a] for a in env.agents]) # [4, local_dim]
+                obs_tensor = torch.tensor(obs_array, dtype=torch.float32).unsqueeze(0).to(device)
+                state = env.get_global_state() # [global_dim]
+                
+                # CRITICAL: Standardize the global state shape to [1, global_dim]
+                state_tensor = torch.tensor(state, dtype=torch.float32).view(1, -1).to(device).detach()
+                
+                with torch.no_grad():
+                    if algo == "comm_mappo":
+                        dist_action, dist_comm, comm_actions_raw, next_hiddens, masked_msg_in, safe_logs = actor(
+                            obs_tensor, hiddens_tensor, tau=current_tau
+                        )
+                        
+                        # ENGINEER FIX: Forced Exploration during warm-up phase
+                        if ep < cfg.agent.warm_up_episodes:
+                            # Override policy with uniform random orders to force environment exploration
+                            actions_raw = torch.rand((len(env.agents), 1), device=device)
+                        else:
+                            actions_raw = dist_action.sample()
+                            
+                        actions_val = actions_raw.view(1, len(env.agents), 1)
+                        comm_actions = comm_actions_raw.view(1, len(env.agents))
+                        
+                        # ENGINEER FIX: Append the discrete indices [0, 1, 2] instead of 
+                        # the continuous embeddings [-1.0, 0.0, 1.0]
+                        episode_messages.append(comm_actions_raw.detach().cpu().numpy())
+                        msg_in_buffer = masked_msg_in.squeeze(0)
+                        comm_acts_buffer = comm_actions.squeeze(0).unsqueeze(-1)
+                        
+                        # Calculate log_probs based on the action taken (works for both forced and sampled)
+                        log_probs_val = dist_action.log_prob(actions_raw).view(1, len(env.agents), 1) + \
+                                        dist_comm.log_prob(comm_actions_raw).view(1, len(env.agents), 1)
+                    else:
+                        dist_action, next_hiddens_raw = actor(obs_tensor.view(-1, local_dim), hiddens_tensor.view(-1, cfg.agent.hidden_dim))
+                        
+                        # ENGINEER FIX: Forced Exploration for IPPO/MAPPO
+                        if ep < cfg.agent.warm_up_episodes:
+                            actions_raw = torch.rand((len(env.agents), 1), device=device)
+                        else:
+                            actions_raw = dist_action.sample()
+                            
+                        actions_val = actions_raw.view(1, len(env.agents), 1)
+                        next_hiddens = next_hiddens_raw.view(1, len(env.agents), -1)
+                        log_probs_val = dist_action.log_prob(actions_raw).view(1, len(env.agents), 1)
+                        msg_in_buffer = None
+                        comm_acts_buffer = None
+                
+                acts = {a: [actions_val[0, i, 0].cpu().item()] for i, a in enumerate(env.agents)}
+                
+                # --- DIAGNOSTIC LOGGING ---
+                # Log orders to WandB to physically verify they are ordering
+                if env.current_step % 10 == 0:
+                    order_quantities = {a: float(np.round(acts[a][0] * env.max_order)) for a in env.agents}
+                    wandb.log({f"Order_Qty/{a}": order_quantities[a] for a in env.agents}, commit=False)
+                
+                # 2. Step Env
+                next_obs, rewards, terms, truncs, infos = env.step(acts)
+                # ENGINEER FIX: Accumulate both total cost AND individual agent costs
+                for a in env.agents:
+                    local_cost = infos[a]["local_cost"]
+                    ep_cost += local_cost
+                    ep_agent_costs[a] += local_cost # This line was missing!
+                
+                # 3. Create Contract-Compliant Tensors
+                r_tensor = torch.zeros(len(env.possible_agents), 1, device=device)
+                t_tensor = torch.zeros(len(env.possible_agents), 1, device=device)
+                for i, a in enumerate(env.possible_agents):
+                    r_tensor[i] = -abs(rewards.get(a, 0.0)) / 100.0
+                    t_tensor[i] = float(terms.get(a, False))
 
-            # 4. PUSH ALL (Using the standardized state_tensor)
-            buffer.push(
-                obs=obs_tensor.squeeze(0).detach(),
-                g_state=state_tensor, # Standardized to [1, global_dim]
-                hidden=hiddens_tensor.squeeze(0).detach(),
-                comm_in=msg_in_buffer.detach() if msg_in_buffer is not None else torch.zeros(len(env.agents), 1, device=device),
-                action=actions_val.squeeze(0).detach(),
-                log_prob=log_probs_val.squeeze(0).detach(),
-                comm_action=comm_acts_buffer.detach() if comm_acts_buffer is not None else torch.zeros(len(env.agents), 1, device=device),
-                reward=r_tensor,
-                terminal=t_tensor
-            )
+                # 4. PUSH ALL (Using the standardized state_tensor)
+                buffer.push(
+                    obs=obs_tensor.squeeze(0).detach(),
+                    g_state=state_tensor, # Standardized to [1, global_dim]
+                    hidden=hiddens_tensor.squeeze(0).detach(),
+                    comm_in=msg_in_buffer.detach() if msg_in_buffer is not None else torch.zeros(len(env.agents), 1, device=device),
+                    action=actions_val.squeeze(0).detach(),
+                    log_prob=log_probs_val.squeeze(0).detach(),
+                    comm_action=comm_acts_buffer.detach() if comm_acts_buffer is not None else torch.zeros(len(env.agents), 1, device=device),
+                    reward=r_tensor,
+                    terminal=t_tensor
+                )
 
-            hiddens_tensor = next_hiddens.detach()
-            obs = next_obs
-            if any(terms.values()) or any(truncs.values()): break
-            
-        actor_loss, critic_loss = trainer.update(buffer, ep)
-        actor_scheduler.step()
-        critic_scheduler.step()
-        
+                hiddens_tensor = next_hiddens.detach()
+                obs = next_obs
+                if any(terms.values()) or any(truncs.values()): break
+                
+                actor_loss, critic_loss = trainer.update(buffer, ep)
+                actor_scheduler.step()
+                critic_scheduler.step()
+
         # Log to W&B
         log_dict = {
             "Cost": ep_cost, 
@@ -148,6 +176,28 @@ def main(cfg: DictConfig):
             "Tau": current_tau if algo == "comm_mappo" else 0.0
         }
         for a, cost in ep_agent_costs.items(): log_dict[f"Cost/{a}"] = cost
+        
+        # ENGINEER FIX: Communication Telemetry
+        if algo == "comm_mappo" and len(episode_messages) > 0:
+            # Flatten all messages sent in this episode by all agents
+            # CRITICAL: .astype(int) is required for np.bincount to work without throwing an error
+            all_msgs = np.concatenate(episode_messages, axis=0).flatten().astype(int)
+            
+            # 1. Log a histogram to W&B (You will see a bar chart of tokens 0, 1, 2)
+            log_dict["Comm/Message_Distribution"] = wandb.Histogram(all_msgs)
+            
+            # 2. Log how many unique words they used this episode
+            log_dict["Comm/Unique_Tokens"] = len(np.unique(all_msgs))
+            
+            # 3. Explicitly log the percentage of EACH token used as individual line charts!
+            # minlength=3 ensures the array length matches vocab_size even if a token isn't used
+            vocab_size = 3
+            token_counts = np.bincount(all_msgs, minlength=vocab_size)
+            token_pcts = (token_counts / len(all_msgs)) * 100.0
+            
+            for v in range(vocab_size):
+                log_dict[f"Comm/Token_{v}_Pct"] = token_pcts[v]
+
         wandb.log(log_dict)
         
         cost_history.append(ep_cost)

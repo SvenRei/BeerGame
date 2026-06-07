@@ -9,22 +9,33 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer
 
-class ReplayBuffer:
+class EpisodeReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
-    def push(self, state, obs, acts, reward, next_state, next_obs, done, hidden, next_hidden):
-        self.buffer.append((state, obs, acts, reward, next_state, next_obs, done, hidden, next_hidden))
+    def push(self, states, obs, actions, rewards, dones):
+        self.buffer.append({
+            "states": np.array(states, dtype=np.float32),
+            "obs": np.array(obs, dtype=np.float32),
+            "actions": np.array(actions, dtype=np.int64),
+            "rewards": np.array(rewards, dtype=np.float32),
+            "dones": np.array(dones, dtype=np.float32)
+        })
     def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
-    def __len__(self):
-        return len(self.buffer)
+        batch = random.sample(self.buffer, batch_size)
+        return {k: torch.tensor(np.stack([b[k] for b in batch])) for k in batch[0].keys()}
+    def __len__(self): return len(self.buffer)
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
     run = wandb.init(project="BeerGame_Research", config=dict(cfg), name="comm_qmix")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg.env.demand_type = "poisson"
+    
+    cfg.env.demand_type = cfg.env.get("demand_type", "step")
     env = BeerGameParallelEnv(cfg.env)
+    
+    obs, _ = env.reset(seed=1000)
+    dummy_global = env.get_global_state()
+    state_dim = len(dummy_global)
     
     cfg.agent.lr = wandb.config.get("lr", cfg.agent.lr)
     cfg.agent.target_update_freq = wandb.config.get("target_update_freq", cfg.agent.target_update_freq)
@@ -35,22 +46,17 @@ def main(cfg: DictConfig):
     os.makedirs(run_dir, exist_ok=True)
     
     local_dim = env.observation_space("retailer").shape[0]
-    
-    # ENGINEER FIX: CTDE State size sync
-    # Use the actual length of the new unclipped global state
-    dummy_global = env.get_global_state()
-    state_dim = len(dummy_global)
-    
     n_actions = cfg.agent.n_actions 
+    if n_actions < 2: raise ValueError(f"n_actions must be >= 2")
     hidden_dim = cfg.agent.hidden_dim
     
     base_agent = CommQMixLocalAgent(local_dim, hidden_dim, n_actions, vocab_size=vocab_size)
-    mac = QMixCommMAC(base_agent, num_agents=len(env.agents)).to(device)
-    mixer = QMixer(len(env.agents), state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
+    mac = QMixCommMAC(base_agent, num_agents=len(env.possible_agents)).to(device)
+    mixer = QMixer(len(env.possible_agents), state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
     
     target_base = CommQMixLocalAgent(local_dim, hidden_dim, n_actions, vocab_size=vocab_size)
-    target_mac = QMixCommMAC(target_base, num_agents=len(env.agents)).to(device)
-    target_mixer = QMixer(len(env.agents), state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
+    target_mac = QMixCommMAC(target_base, num_agents=len(env.possible_agents)).to(device)
+    target_mixer = QMixer(len(env.possible_agents), state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
     
     target_mac.load_state_dict(mac.state_dict())
     target_mixer.load_state_dict(mixer.state_dict())
@@ -59,7 +65,7 @@ def main(cfg: DictConfig):
     optimizer = optim.Adam(all_params, lr=cfg.agent.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
     
-    buffer = ReplayBuffer(cfg.agent.buffer_size)
+    buffer = EpisodeReplayBuffer(cfg.agent.buffer_size)
     
     patience, since_imp = cfg.agent.get("patience", 2000), 0
     warm_up = cfg.agent.get("warm_up_episodes", 1000)
@@ -67,117 +73,115 @@ def main(cfg: DictConfig):
     cost_history = deque(maxlen=50)
     best_avg_cost, global_step, epsilon = float('inf'), 0, cfg.agent.epsilon_start
     
-    # ENGINEER FIX: MAPPO-Identical Tau Schedule
-    tau_start = 1.0
-    tau_min = 0.1
+    tau_start, tau_min = 1.0, 0.1
     tau_decay_episodes = cfg.total_episodes * 0.5
 
-    print(f"--- Starting COMM_QMIX Training Marathon ---")
+    print(f"--- Starting COMM_QMIX Sequence Replay Marathon ---")
 
     for ep in range(cfg.total_episodes):
-        # IDENTICAL TAU SCHEDULE TO MAPPO
-        if ep >= tau_decay_episodes:
-            tau = tau_min
-        else:
-            tau = tau_start - (tau_start - tau_min) * (ep / tau_decay_episodes)
+        if ep >= tau_decay_episodes: tau = tau_min
+        else: tau = tau_start - (tau_start - tau_min) * (ep / tau_decay_episodes)
         
         obs, _ = env.reset(seed=1000 + ep)
         mac.init_buffer(batch_size=1, device=device)
-        hiddens_tensor = torch.zeros(1, len(env.agents), hidden_dim).to(device)
+        hiddens_tensor = torch.zeros(1, len(env.possible_agents), hidden_dim).to(device)
         
+        ep_states, ep_obs, ep_actions, ep_rewards, ep_dones = [], [], [], [], []
         ep_cost = 0.0
+        ep_agent_costs = {a: 0.0 for a in env.possible_agents}
         episode_messages = []
         
+        ep_obs.append(np.stack([obs[a] for a in env.possible_agents]))
+        ep_states.append(env.get_global_state())
+        
         while True:
-            obs_array = np.stack([obs[a] for a in env.agents])
+            current_agents = env.possible_agents 
+            obs_array = np.stack([obs[a] for a in current_agents])
             obs_tensor = torch.tensor(obs_array, dtype=torch.float32).unsqueeze(0).to(device)
             
-            # ENGINEER FIX: Fetch true global state
-            state = env.get_global_state()
-            
             with torch.no_grad():
-                # ENGINEER FIX: Ensure hiddens_tensor does not retain graph memory
-                q_vals, next_hiddens, safe_logs = mac(obs_tensor, hiddens_tensor.detach(), tau=tau)
+                q_vals, next_hiddens, _, safe_logs = mac(obs_tensor, hiddens_tensor.detach(), tau=tau)
                 episode_messages.append(safe_logs)
                 
-            acts, env_acts = {}, {}
-            actions_list = []
-            
-            for i, a in enumerate(env.agents):
-                if random.random() < epsilon:
-                    action_idx = random.randint(0, n_actions - 1)
-                else:
-                    action_idx = q_vals[0, i].argmax(dim=-1).item()
+            acts, env_acts, actions_list = {}, {}, []
+            for i, a in enumerate(current_agents):
+                if random.random() < epsilon: action_idx = random.randint(0, n_actions - 1)
+                else: action_idx = q_vals[0, i].argmax(dim=-1).item()
                 
                 acts[a] = action_idx
-                actions_list.append(action_idx)
+                actions_list.append([action_idx])
+                env_acts[a] = [action_idx / max(1, n_actions - 1)]
                 
-                # FAIR BENCHMARK FIX:
-                # If n_actions=101, an index of 50 becomes 50 / 100 = 0.5.
-                # The env will multiply 0.5 * max_order (100) to get 50.
-                env_acts[a] = [action_idx / (n_actions - 1)]
-                
-            next_obs, rewards, terms, truncs, infos = env.step(env_acts)
-            raw_cost = sum(infos[a]["local_cost"] for a in env.agents)
-            ep_cost += raw_cost
-            
-            global_reward = -np.log1p(raw_cost)
+            if env.current_step % 10 == 0: wandb.log({f"Order_Qty/{a}": float(np.round(env_acts[a][0] * env.max_order)) for a in current_agents}, commit=False)
 
-            next_state = env.get_global_state()
-            next_obs_array = np.stack([next_obs[a] for a in env.agents])
+            next_obs, rewards, terms, truncs, infos = env.step(env_acts)
             
+            raw_cost = sum(infos[a].get("local_cost", 0.0) for a in current_agents)
+            ep_cost += raw_cost
+            for a in current_agents: ep_agent_costs[a] += infos[a].get("local_cost", 0.0)
+            
+            global_reward = -raw_cost / 100.0 
             done = any(terms.values()) or any(truncs.values())
             
-            buffer.push(
-                state, 
-                obs_array, 
-                actions_list, 
-                global_reward, 
-                next_state, 
-                next_obs_array, 
-                done, 
-                hiddens_tensor.detach().cpu().numpy(), 
-                next_hiddens.detach().cpu().numpy()
-            )
+            ep_actions.append(actions_list)
+            ep_rewards.append([global_reward])
+            ep_dones.append([float(done)])
+            ep_obs.append(np.stack([next_obs[a] for a in current_agents]))
+            ep_states.append(env.get_global_state())
             
             obs = next_obs
-            hiddens_tensor = next_hiddens.detach() # FIX: Prevent graph memory leak
+            hiddens_tensor = next_hiddens.detach() 
             global_step += 1
             
+            # ---------------- BATCH TRAINING (BPTT through Messages) ----------------
             if len(buffer) > cfg.agent.batch_size:
                 batch = buffer.sample(cfg.agent.batch_size)
                 
-                b_states = torch.tensor(np.array([b[0] for b in batch]), dtype=torch.float32).to(device)
-                b_obs = torch.tensor(np.array([b[1] for b in batch]), dtype=torch.float32).to(device)
-                b_actions = torch.tensor(np.array([b[2] for b in batch]), dtype=torch.long).unsqueeze(-1).to(device)
-                b_rewards = torch.tensor(np.array([b[3] for b in batch]), dtype=torch.float32).unsqueeze(1).to(device)
-                b_next_states = torch.tensor(np.array([b[4] for b in batch]), dtype=torch.float32).to(device)
-                b_next_obs = torch.tensor(np.array([b[5] for b in batch]), dtype=torch.float32).to(device)
-                b_dones = torch.tensor(np.array([b[6] for b in batch]), dtype=torch.float32).unsqueeze(1).to(device)
+                b_states = batch["states"].to(device)
+                b_obs = batch["obs"].to(device)       
+                b_actions = batch["actions"].to(device) 
+                b_rewards = batch["rewards"].to(device) 
+                b_dones = batch["dones"].to(device)     
                 
-                b_h = torch.tensor(np.array([b[7] for b in batch]), dtype=torch.float32).to(device)
-                b_next_h = torch.tensor(np.array([b[8] for b in batch]), dtype=torch.float32).to(device)
+                B, T_plus_1, N, _ = b_obs.shape
+                T = T_plus_1 - 1
                 
-                mac.init_buffer(cfg.agent.batch_size, device)
-                target_mac.init_buffer(cfg.agent.batch_size, device)
+                q_evals_list, target_q_evals_list = [], []
                 
-                # Calculate current Q values
-                q_evals, _, _ = mac(b_obs, b_h, tau=tau)
-                chosen_q_evals = torch.gather(q_evals, dim=2, index=b_actions)
+                h_train = torch.zeros(B, N, hidden_dim).to(device)
+                target_h_train = torch.zeros(B, N, hidden_dim).to(device)
                 
-                with torch.no_grad():
-                    # Calculate Next Q values
-                    online_next_q, _, _ = mac(b_next_obs, b_next_h, tau=tau)
-                    best_next_actions = online_next_q.argmax(dim=2, keepdim=True)
-                    target_q, _, _ = target_mac(b_next_obs, b_next_h, tau=tau)
-                    target_q_evals = torch.gather(target_q, dim=2, index=best_next_actions)
+                msg_in = torch.zeros(B, N, 1).to(device)
+                target_msg_in = torch.zeros(B, N, 1).to(device)
+                
+                # Unroll completely through time, letting gradients pass from t+1 back to t
+                for t in range(T_plus_1):
+                    q_t, h_train, msg_out, _ = mac(b_obs[:, t], h_train, tau=tau, msg_in=msg_in)
+                    msg_in = msg_out # Differentiable link for the next loop!
+                    q_evals_list.append(q_t)
                     
-                q_tot = mixer(chosen_q_evals, b_states)
-                with torch.no_grad():
-                    target_q_tot = target_mixer(target_q_evals, b_next_states)
+                    with torch.no_grad():
+                        target_q_t, target_h_train, target_msg_out, _ = target_mac(b_obs[:, t], target_h_train, tau=tau, msg_in=target_msg_in)
+                        target_msg_in = target_msg_out
+                        target_q_evals_list.append(target_q_t)
+                        
+                q_evals = torch.stack(q_evals_list, dim=1) # [B, T+1, N, n_actions]
+                target_q_evals = torch.stack(target_q_evals_list, dim=1)
+                
+                chosen_q = q_evals[:, :-1].gather(3, b_actions) # [B, T, N, 1]
+                best_next_actions = q_evals[:, 1:].argmax(dim=3, keepdim=True)
+                target_q_gathered = target_q_evals[:, 1:].gather(3, best_next_actions) 
+                
+                b_states_t = b_states[:, :-1, :]
+                b_states_next = b_states[:, 1:, :]
+                
+                q_tot = mixer(chosen_q.reshape(B*T, N, 1), b_states_t.reshape(B*T, -1))
+                with torch.no_grad(): target_q_tot = target_mixer(target_q_gathered.reshape(B*T, N, 1), b_states_next.reshape(B*T, -1))
                     
-                targets = b_rewards + cfg.agent.gamma * (1 - b_dones) * target_q_tot.squeeze(2)
-                loss = nn.MSELoss()(q_tot.squeeze(2), targets.detach())
+                q_tot_flat = q_tot.reshape(B*T, 1)
+                targets = b_rewards.reshape(B*T, 1) + cfg.agent.gamma * (1 - b_dones.reshape(B*T, 1)) * target_q_tot.reshape(B*T, 1)
+                
+                loss = nn.MSELoss()(q_tot_flat, targets.detach())
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -190,16 +194,30 @@ def main(cfg: DictConfig):
                 
             if done: break
             
+        buffer.push(ep_states, ep_obs, ep_actions, ep_rewards, ep_dones)
         scheduler.step()
-        epsilon = max(cfg.agent.epsilon_end, cfg.agent.epsilon_start - ep / cfg.agent.epsilon_decay_episodes)
+        
+        decay_step = (cfg.agent.epsilon_start - cfg.agent.epsilon_end) / cfg.agent.epsilon_decay_episodes
+        epsilon = max(cfg.agent.epsilon_end, cfg.agent.epsilon_start - decay_step * ep)
         
         cost_history.append(ep_cost)
         avg_cost = sum(cost_history) / len(cost_history)
         
-        wandb.log({"Cost": ep_cost, "Avg_Cost_50": avg_cost, "Epsilon": epsilon, "Tau": tau, "LR": scheduler.get_last_lr()[0]})
+        log_dict = {"Cost": ep_cost, "Avg_Cost_50": avg_cost, "Epsilon": epsilon, "Tau": tau, "LR": scheduler.get_last_lr()[0]}
+        for a, cost in ep_agent_costs.items(): log_dict[f"Cost/{a}"] = cost
+            
+        if len(episode_messages) > 0:
+            all_msgs = np.concatenate(episode_messages, axis=0).flatten().astype(int)
+            log_dict["Comm/Message_Distribution"] = wandb.Histogram(all_msgs)
+            log_dict["Comm/Unique_Tokens"] = len(np.unique(all_msgs))
+            vocab_size = 3
+            token_counts = np.bincount(all_msgs, minlength=vocab_size)
+            token_pcts = (token_counts / len(all_msgs)) * 100.0
+            for v in range(vocab_size): log_dict[f"Comm/Token_{v}_Pct"] = token_pcts[v]
+            
+        wandb.log(log_dict)
         
         if ep == warm_up: best_avg_cost, since_imp = float('inf'), 0
-            
         if avg_cost < best_avg_cost and len(cost_history) == 50: 
             best_avg_cost = avg_cost
             since_imp = 0
@@ -211,8 +229,7 @@ def main(cfg: DictConfig):
                 
         exploration_lock = max(warm_up, eps_decay_eps)
         if ep > exploration_lock and since_imp >= patience: break
-        if ep % 10 == 0: 
-            print(f"Ep {ep} | Cost: {ep_cost:.2f} | 50-Ep Avg: {avg_cost:.2f} | Best: {best_avg_cost if best_avg_cost != float('inf') else 0.0:.2f} | Eps: {epsilon:.2f} | Tau: {tau:.2f}")
+        if ep % 10 == 0: print(f"Ep {ep} | Cost: {ep_cost:.2f} | 50-Ep Avg: {avg_cost:.2f} | Best: {best_avg_cost if best_avg_cost != float('inf') else 0.0:.2f} | Eps: {epsilon:.2f} | Tau: {tau:.2f}")
             
     wandb.finish()
 

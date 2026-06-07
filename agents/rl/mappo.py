@@ -41,14 +41,21 @@ class MAPPOActor(nn.Module):
         nn.init.constant_(self.action_mean.bias, -0.75)
 
     def forward(self, obs, hidden):
-        x = self.fc(obs).unsqueeze(0)
+        # ENGINEER FIX 1: Scale raw observations
+        scaled_obs = obs / 100.0
+        
+        x = self.fc(scaled_obs).unsqueeze(0)
         hidden = hidden.unsqueeze(0)
         x, hidden = self.gru(x, hidden)
         x = x.squeeze(0)
         hidden = hidden.squeeze(0)
         
         mean = torch.sigmoid(self.action_mean(x))
-        std = self.action_log_std.exp().expand_as(mean)
+        
+        # ENGINEER FIX 2: Clamp log_std to prevent Variance Collapse (NaNs)
+        clamped_log_std = torch.clamp(self.action_log_std, min=-3.0, max=0.5)
+        std = clamped_log_std.exp().expand_as(mean)
+        
         return Normal(mean, std), hidden
 
     def evaluate_actions(self, obs_seq, hidden_0, action_seq):
@@ -56,29 +63,38 @@ class MAPPOActor(nn.Module):
         ENGINEER FIX: Recurrent Unrolling for BPTT.
         Evaluates an entire sequence (T, Num_Agents, Dim) to maintain gradient memory.
         """
-        x = self.fc(obs_seq)
+        # ENGINEER FIX 1 (BPTT Path): Scale raw observations
+        scaled_obs_seq = obs_seq / 100.0
+        
+        x = self.fc(scaled_obs_seq)
         x, _ = self.gru(x, hidden_0) # Gradients flow through time T here
         
         mean = torch.sigmoid(self.action_mean(x))
-        std = self.action_log_std.exp().expand_as(mean)
-        dist = Normal(mean, std)
         
+        # ENGINEER FIX 2 (BPTT Path): Clamp log_std to prevent Variance Collapse (NaNs)
+        clamped_log_std = torch.clamp(self.action_log_std, min=-3.0, max=0.5)
+        std = clamped_log_std.exp().expand_as(mean)
+        
+        dist = Normal(mean, std)
         action_log_probs = dist.log_prob(action_seq)
+        
         return action_log_probs, dist.entropy().mean()
 
 class CommMAPPOActor(nn.Module):
     def __init__(self, obs_dim, hidden_dim, vocab_size): 
         super().__init__()
         
-        self.vocab_size = vocab_size # Save this to use in forward/evaluate
-        comm_dim = vocab_size 
+        self.vocab_size = vocab_size
+        comm_dim = 1 
         
         self.fc = nn.Sequential(
-            nn.Linear(obs_dim + comm_dim, hidden_dim), # Expects 8 + 3 = 11
+            nn.Linear(obs_dim + comm_dim, hidden_dim),
             nn.ReLU(),
         )
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=False)
         self.action_mean = nn.Linear(hidden_dim, 1)
+        
+        # We still use a parameter, but we will clamp it in the forward pass
         self.action_log_std = nn.Parameter(torch.full((1, 1), -1.0)) 
         
         self.comm_head = nn.Sequential(
@@ -91,12 +107,11 @@ class CommMAPPOActor(nn.Module):
         nn.init.constant_(self.action_mean.bias, -0.75)
 
     def forward(self, obs, comm_in, hidden, tau=1.0):
-        # 1. ENGINEER FIX: Convert index (size 1) to one-hot (size 3) BEFORE passing to FC
-        comm_in_idx = comm_in.long().squeeze(-1) # Remove the trailing dimension
-        comm_one_hot = F.one_hot(comm_in_idx, num_classes=self.vocab_size).float() 
+        # ENGINEER FIX 1: Scale raw observations (e.g. inventory 2000 -> 20.0)
+        # This prevents the GRU from saturating and exploding gradients.
+        scaled_obs = obs / 100.0 
         
-        # 2. Concatenate obs (8) + one_hot (3) = 11
-        x = torch.cat([obs, comm_one_hot], dim=-1)
+        x = torch.cat([scaled_obs, comm_in], dim=-1)
         
         x = self.fc(x).unsqueeze(0)
         hidden = hidden.unsqueeze(0)
@@ -106,7 +121,11 @@ class CommMAPPOActor(nn.Module):
         hidden = hidden.squeeze(0)
         
         mean = torch.sigmoid(self.action_mean(x_flat))
-        std = self.action_log_std.exp().expand_as(mean)
+        
+        # ENGINEER FIX 2: Clamp the log_std. 
+        # min=-3.0 prevents std from reaching 0. max=0.5 prevents infinite exploration.
+        clamped_log_std = torch.clamp(self.action_log_std, min=-3.0, max=0.5)
+        std = clamped_log_std.exp().expand_as(mean)
         
         msg_logits = self.comm_head(x_flat)
         dist_comm = Categorical(logits=msg_logits)
@@ -115,21 +134,19 @@ class CommMAPPOActor(nn.Module):
         return Normal(mean, std), dist_comm, msg_probs, hidden
 
     def evaluate_actions(self, obs_seq, comm_in_seq, hidden_0, action_seq, comm_action_seq):
-        """
-        ENGINEER FIX: Apply the same one-hot encoding to the batch sequence
-        """
-        # comm_in_seq shape is [T, Num_Agents, 1]. Squeeze it to [T, Num_Agents]
-        comm_in_idx = comm_in_seq.long().squeeze(-1)
-        comm_one_hot = F.one_hot(comm_in_idx, num_classes=self.vocab_size).float()
+        # ENGINEER FIX 1 (BPTT Path): Scale raw observations
+        scaled_obs_seq = obs_seq / 100.0
         
-        # Concatenate properly
-        x = torch.cat([obs_seq, comm_one_hot], dim=-1)
+        x = torch.cat([scaled_obs_seq, comm_in_seq], dim=-1)
         
         x = self.fc(x)
-        x, _ = self.gru(x, hidden_0) # Unrolls through time T
+        x, _ = self.gru(x, hidden_0) 
         
         mean = torch.sigmoid(self.action_mean(x))
-        std = self.action_log_std.exp().expand_as(mean)
+        
+        # ENGINEER FIX 2 (BPTT Path): Clamp the log_std
+        clamped_log_std = torch.clamp(self.action_log_std, min=-3.0, max=0.5)
+        std = clamped_log_std.exp().expand_as(mean)
         dist_action = Normal(mean, std)
         
         msg_logits = self.comm_head(x)
@@ -139,9 +156,6 @@ class CommMAPPOActor(nn.Module):
         comm_log_probs = dist_comm.log_prob(comm_action_seq.squeeze(-1))
         
         entropy = dist_action.entropy().mean() + dist_comm.entropy().mean()
-
-        print(f"DEBUG: Max-Min Logits: {msg_logits.max() - msg_logits.min():.4f}")
-        print(f"DEBUG: Logits Mean: {msg_logits.mean():.4f}")
         
         return action_log_probs, comm_log_probs, dist_comm.probs, entropy
 
@@ -196,8 +210,12 @@ class MAPPOCritic(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), 
             nn.Linear(hidden_dim, 1)
         )
+        
     def forward(self, state):
-        return self.fc(state)
+        # ENGINEER FIX 3: Scale the global state for the Critic.
+        # If the Actor saturates on unscaled inputs, the Critic's MSE loss will explode too.
+        scaled_state = state / 100.0
+        return self.fc(scaled_state)
 
 class MAPPOTrainer:
     def __init__(self, actor, critic, cfg, total_episodes, device, algo):
