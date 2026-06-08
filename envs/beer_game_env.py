@@ -58,10 +58,6 @@ class BeerGameParallelEnv(ParallelEnv):
         if not _is_strict_num(self.h) or not _is_strict_num(self.b): raise ValueError("Costs must be numeric")
         if not np.isfinite(self.h) or not np.isfinite(self.b) or self.h < 0 or self.b < 0: raise ValueError("Costs must be finite positive")
             
-        alpha = self._config.get("reward_alpha", 1.0)
-        if not _is_strict_num(alpha) or not (0.0 <= alpha <= 1.0) or not np.isfinite(alpha):
-            raise ValueError("reward_alpha must be finite in [0, 1]")
-            
         jitter = self._config.get("jittery_lead_time", False)
         if type(jitter) is not bool: raise ValueError("jittery_lead_time must be a strict boolean")
         
@@ -247,15 +243,14 @@ class BeerGameParallelEnv(ParallelEnv):
 
         # --- PHASE 4: ACCOUNTING & REWARDS ---
         done = self.current_step >= self.horizon
-        alpha = self._config.get("reward_alpha", 1.0) 
-        
+
         for agent in self.agents:
             cost = (self.h * self.inventory[agent]) + (self.b * self.backlog[agent])
             total_system_cost += cost
             infos[agent] = {"local_cost": cost}
 
         for agent in self.agents:
-            rewards[agent] = -((1.0 - alpha) * infos[agent]["local_cost"]) - (alpha * total_system_cost)
+            rewards[agent] = -total_system_cost
             terminations[agent] = False
             truncations[agent] = done
 

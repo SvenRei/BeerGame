@@ -1,5 +1,6 @@
 algorithm: "ippo"
 hidden_dim: 256
+n_actions: 101
 lr_actor: 3e-4
 lr_critic: 1e-3
 gamma: 0.99
@@ -8,3 +9,7 @@ eps_clip: 0.1
 entropy_coef: 0.10
 max_grad_norm: 0.2
 warm_up_episodes: 1000
+patience: 2000
+reward_scale: 100
+lr_scheduler_step: 2000
+lr_scheduler_gamma: 0.5

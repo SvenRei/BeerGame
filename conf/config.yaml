@@ -31,5 +31,3 @@ env:
   demand_type: "poisson"
   # Toggle to introduce stochastic noise into the 4-week delay
   jittery_lead_time: False
-  # Softens the cooperative penalty to prevent global costs from crushing local learning
-  reward_alpha: 0.1
