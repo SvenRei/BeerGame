@@ -301,18 +301,25 @@ class MAPPOTrainer:
                 # Batched recurrent eval conditioned on the messages that ACTUALLY flowed
                 # during rollout. One GRU call over the whole sequence instead of a T-step
                 # loop. self.actor is the MAC; self.actor.actor is the CommMAPPOActor.
-                act_log_probs, comm_log_probs, _comm_probs, entropy = self.actor.actor.evaluate_actions(
+                act_log_probs, comm_log_probs, comm_probs, entropy = self.actor.actor.evaluate_actions(
                     obs_seq, comm_in_seq, hidden_0, actions_seq, comm_actions_seq
                 )
                 current_log_probs_seq = act_log_probs + comm_log_probs.unsqueeze(-1)
+                
+                # Penalize the expected magnitude of the generated message
+                vocab_tensor = get_vocab_tensor(self.actor.vocab_size, self.device)
+                expected_msg = (comm_probs * vocab_tensor).sum(dim=-1)
+                comm_penalty = self.comm_penalty_coef * (expected_msg ** 2).mean()
+                
             else:
                 act_log_probs, entropy = self.actor.evaluate_actions(obs_seq, hidden_0, actions_seq)
                 current_log_probs_seq = act_log_probs
+                comm_penalty = torch.tensor(0.0, device=self.device)
 
             ratios = torch.exp(current_log_probs_seq - old_log_probs_seq)
             surr1 = ratios * advantages_seq
             surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages_seq
-            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy + comm_penalty
 
             if self.algo == "ippo":
                 values_flat = self.critic(obs_seq.reshape(T * num_agents, -1))

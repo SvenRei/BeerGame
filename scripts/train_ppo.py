@@ -65,10 +65,10 @@ def main(cfg: DictConfig):
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     # Apply sweep overrides to cfg, then log the resolved config
-    with open_dict(cfg):
-        for key in ["lr_actor", "lr_critic", "k_epochs", "eps_clip", "entropy_coef", "hidden_dim", "vocab_size", "lr_scheduler_step", "lr_scheduler_gamma"]:
-            if key in wandb.config:
-                cfg.agent[key] = wandb.config[key]
+    #with open_dict(cfg):
+    #    for key in ["lr_actor", "lr_critic", "k_epochs", "eps_clip", "entropy_coef", "hidden_dim", "vocab_size", "lr_scheduler_step", "lr_scheduler_gamma"]:
+    #        if key in wandb.config:
+    #            cfg.agent[key] = wandb.config[key]
     wandb.config.update(OmegaConf.to_container(cfg, resolve=True), allow_val_change=True)
 
     env = BeerGameParallelEnv(cfg.env)

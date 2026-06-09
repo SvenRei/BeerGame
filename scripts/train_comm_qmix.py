@@ -82,6 +82,7 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
     target_msg_in = torch.zeros(B, N, 1, device=device)
 
     q_evals_list, target_q_evals_list = [], []
+    msg_out_list = []
 
     # Online network: hard=False keeps Gumbel-softmax differentiable so gradients
     # flow back through msg_stream. Target network runs inside no_grad.
@@ -89,6 +90,7 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
         q_t, h_train, msg_out, _ = mac(b_obs[:, t], h_train, tau=tau, msg_in=msg_in, hard=False)
         msg_in = msg_out  # keep gradient flow through communication
         q_evals_list.append(q_t)
+        msg_out_list.append(msg_out)
 
         with torch.no_grad():
             target_q_t, target_h_train, target_msg_out, _ = target_mac(b_obs[:, t], target_h_train, tau=tau, msg_in=target_msg_in, hard=False)
@@ -97,7 +99,7 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
 
     q_evals = torch.stack(q_evals_list, dim=1)             # [B, T+1, N, A]
     target_q_evals = torch.stack(target_q_evals_list, dim=1)
-
+    
     chosen_q = q_evals[:, :-1].gather(3, b_actions)       # [B, T, N, 1]
     best_next_actions = q_evals[:, 1:].argmax(dim=3, keepdim=True)
     target_q_gathered = target_q_evals[:, 1:].gather(3, best_next_actions)
@@ -110,7 +112,11 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
 
     q_tot_flat = q_tot.reshape(B * T, 1)
     targets = b_rewards.reshape(B * T, 1) + cfg.agent.gamma * (1.0 - b_dones.reshape(B * T, 1)) * target_q_tot.reshape(B * T, 1)
-    loss = nn.MSELoss()(q_tot_flat, targets.detach())
+    base_loss = nn.MSELoss()(q_tot_flat, targets.detach())
+    msg_outs_tensor = torch.stack(msg_out_list, dim=1) # Shape: [B, T+1, N, 1]
+    comm_penalty = cfg.agent.comm_penalty_coef * (msg_outs_tensor ** 2).mean()
+
+    loss = base_loss + comm_penalty
 
     optimizer.zero_grad()
     loss.backward()
@@ -135,10 +141,10 @@ def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    with open_dict(cfg):
-        for key in ["lr", "target_update_freq", "batch_size", "vocab_size", "hidden_dim", "n_actions", "lr_scheduler_step", "lr_scheduler_gamma"]:
-            if key in wandb.config:
-                cfg.agent[key] = wandb.config[key]
+    #with open_dict(cfg):
+    #    for key in ["lr", "target_update_freq", "batch_size", "vocab_size", "hidden_dim", "n_actions", "lr_scheduler_step", "lr_scheduler_gamma"]:
+    #        if key in wandb.config:
+    #            cfg.agent[key] = wandb.config[key]
     wandb.config.update(OmegaConf.to_container(cfg, resolve=True), allow_val_change=True)
 
     vocab_size = cfg.agent.get("vocab_size", 3)

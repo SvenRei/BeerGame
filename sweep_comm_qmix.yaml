@@ -26,7 +26,7 @@
 #   * agent keys      -> agent.*  :  agent.lr, agent.warm_up_episodes, ...
 # =============================================================================
 
-program: agents/rl/train_qmix.py   # path RELATIVE to where you run `wandb agent`
+program: scripts/train_comm_qmix.py  # path RELATIVE to where you run `wandb agent`
                                    # (launch from repo root) -- or use an absolute path.
 project: BeerGame_Research         # must match wandb.init(project=...) in the code
 # entity: your-wandb-username      # uncomment + set to your wandb user/team
@@ -94,6 +94,8 @@ command:
   - ${interpreter}
   - ${program}
   - agent=comm_qmix            # selects conf/agent/comm_qmix.yaml (the Hydra group)
+  - hydra.job.chdir=False      # FIX 2: Stop Hydra from changing directories
+  - hydra.output_subdir=null   # FIX 2: Disable writing .hydra configs to disk
   - total_episodes=10000       # longer than the 5k diagnostic: these numbers go in the thesis
   - seed=42                    # FIXED during search (see multi-seed note at bottom)
   - agent.warm_up_episodes=1000  # production warm-up (fills replay buffer)

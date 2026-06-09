@@ -19,7 +19,7 @@
 # ignored. Keep the command/${args_no_hyphens} structure.
 # =============================================================================
 
-program: agents/rl/train_ppo.py    # NOTE: PPO agents use train_ppo.py
+program: scripts/train_ppo.py    # NOTE: PPO agents use train_ppo.py
 project: BeerGame_Research
 # entity: your-wandb-username
 
@@ -76,6 +76,8 @@ command:
   - ${interpreter}
   - ${program}
   - agent=comm_mappo
+  - hydra.job.chdir=False      # FIX 2: Stop Hydra from changing directories
+  - hydra.output_subdir=null   # FIX 2: Disable writing .hydra configs to disk
   - total_episodes=10000
   - seed=42
   - agent.warm_up_episodes=1000

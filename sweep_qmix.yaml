@@ -13,7 +13,7 @@
 # train_qmix.py's wandb.config handling so every key actually takes effect.
 # =============================================================================
 
-program: agents/rl/train_qmix.py
+program: scripts/train_qmix.py
 project: BeerGame_Research
 # entity: your-wandb-username
 
@@ -52,6 +52,8 @@ command:
   - ${interpreter}
   - ${program}
   - agent=qmix
+  - hydra.job.chdir=False      # FIX 2: Stop Hydra from changing directories
+  - hydra.output_subdir=null   # FIX 2: Disable writing .hydra configs to disk  
   - total_episodes=10000
   - seed=42
   - agent.warm_up_episodes=1000
