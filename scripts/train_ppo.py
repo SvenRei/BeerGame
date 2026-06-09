@@ -61,6 +61,9 @@ def main(cfg: DictConfig):
 
     # wandb.init first so sweep params are injected into wandb.config
     run = wandb.init(project="BeerGame_Research", name=cfg.agent.algorithm)
+    # Sweep optimizes the run summary of Avg_Cost_50; take the BEST (min) over the run,
+    # not the noisy last value.
+    wandb.define_metric("Avg_Cost_50", summary="min")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

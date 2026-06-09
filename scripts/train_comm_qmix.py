@@ -138,6 +138,9 @@ def main(cfg: DictConfig):
     set_global_seeds(base_seed)
 
     run = wandb.init(project="BeerGame_Research", name="comm_qmix")
+    # Sweep optimizes the run summary of Avg_Cost_50; take the BEST (min) over the run,
+    # not the noisy last value (critical for the high-variance QMIX family).
+    wandb.define_metric("Avg_Cost_50", summary="min")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
