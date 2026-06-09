@@ -22,6 +22,9 @@ weights_ippo/
 *.log
 .DS_Store
 
+# Machine-specific local sweep configs (Windows variants, ${env} removed)
+sweep_*_local.yaml
+
 # IDEs
 .vscode/
 .idea/
