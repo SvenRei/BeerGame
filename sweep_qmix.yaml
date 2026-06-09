@@ -1,21 +1,69 @@
-program: scripts/train_qmix.py
+# =============================================================================
+# W&B SWEEP  --  qmix   (vanilla QMIX, NO communication baseline)
+# =============================================================================
+# Role: the no-comm control for the QMIX family. comm_qmix(vocab>=3) minus qmix
+# is the value of communication within the value-learning family.
+#
+# Status from the 5k diagnostic: qmix LEARNS but is UNSTABLE -- best ~21k, final
+# ~29k, and cost swung wildly (16k-82k) across the run. So this sweep targets
+# STABILITY (target-update rate, batch size, lr), not just raw lr.
+#
+# Mechanics identical to sweep_comm_qmix.yaml: params are passed as HYDRA CLI
+# overrides via `command` + ${args_no_hyphens}; dotted names (agent.*) bypass
+# train_qmix.py's wandb.config handling so every key actually takes effect.
+# =============================================================================
+
+program: agents/rl/train_qmix.py
+project: BeerGame_Research
+# entity: your-wandb-username
+
 method: bayes
+
 metric:
   name: Avg_Cost_50
   goal: minimize
+
+run_cap: 30                        # smaller space than comm_qmix -> fewer runs needed
+
+# early_terminate intentionally OFF for the QMIX family (noisy; slow-starters
+# can recover -- see the comm_qmix file for the evidence).
+
 parameters:
+
+  # LEARNING RATE -- bracket the value that won at 5k (1e-3).
   agent.lr:
-    values: [0.001, 0.0005, 0.0001, 0.00005]
+    values: [0.0005, 0.001, 0.002]
+
+  # TARGET-NETWORK refresh (env steps). This is the prime suspect for qmix's
+  # instability: refreshing every 200 steps makes the online net chase a
+  # fast-moving target. Less frequent updates (600/1000) often stabilize QMIX.
   agent.target_update_freq:
-    values: [100, 200, 500, 1000]
-  # UPGRADE 1: Expanded Batch Size Net
+    values: [200, 600, 1000]
+
+  # BATCH SIZE off the replay buffer. Larger batches reduce gradient variance,
+  # which directly attacks the 16k-82k swing we observed. buffer_size is 5000,
+  # so 128 is still well-supported.
   agent.batch_size:
-    values: [64, 128, 256, 512]
-  # UPGRADE 2: Discretization Resolution Search
-  agent.n_actions:
-    values: [11, 21, 51, 101]
+    values: [32, 64, 128]
+
+# ---- Fixed run-control -------------------------------------------------------
 command:
-  - venv/Scripts/python.exe
+  - ${env}
+  - ${interpreter}
   - ${program}
   - agent=qmix
+  - total_episodes=10000
+  - seed=42
+  - agent.warm_up_episodes=1000
+  - agent.patience=2000
+  - agent.reward_scale=100
+  - agent.epsilon_decay_episodes=5000
   - ${args_no_hyphens}
+
+# -----------------------------------------------------------------------------
+# Phase-2 multi-seed confirmation: same recipe as the comm_qmix file -- switch to
+# method: grid, vary only seed [42,123,2024], pin the winning hyperparameters in
+# the command, report mean +/- std.
+#
+# LAUNCH:  wandb sweep sweep_qmix.yaml  ->  wandb agent <SWEEP_ID>
+# =============================================================================

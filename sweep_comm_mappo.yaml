@@ -1,22 +1,91 @@
-program: scripts/train_ppo.py
-method: bayes
-metric:
-  goal: minimize
-  name: Avg_Cost_50
-parameters:
-  agent.lr_actor:
-    values: [0.00005, 0.0001, 0.0003, 0.001]
-  agent.lr_critic:
-    values: [0.0001, 0.0005, 0.001, 0.003]
-  agent.k_epochs:
-    values: [4, 10, 15]
-  agent.eps_clip:
-    values: [0.1, 0.2, 0.3]
-  agent.entropy_coef:
-    values: [0.01, 0.05, 0.1]
+# =============================================================================
+# W&B SWEEP  --  comm_mappo   (PPO family WITH communication)
+# =============================================================================
+# Status from the 5k diagnostic: HEALTHY. Converged to ~25.4k, held all 3 tokens
+# the whole run, and the batched-evaluate_actions fix brought runtime to ~1.35x
+# mappo (no longer 9x). It is second to comm_qmix simply because comm_qmix is
+# exceptional on this value-learning-friendly task -- comm_mappo is NOT broken.
+#
+# Two things to probe (both flagged as concerns in the 5k review):
+#   * entropy_coef directly controls token diversity -> sweep it.
+#   * the LR scheduler decayed actor LR to 7e-5 by the end (possibly freezing
+#     learning) -> sweep lr_scheduler_gamma including 1.0 (= no decay).
+#
+# *** CRITICAL MECHANICS NOTE for this file specifically ***
+# comm_penalty_coef is NOT in train_ppo.py's wandb.config allow-list. The ONLY
+# reason sweeping it works is that we pass it as a HYDRA OVERRIDE via the
+# `command` block below (agent.comm_penalty_coef=...). If you ever switch this
+# sweep to the plain wandb.config style, comm_penalty_coef will be silently
+# ignored. Keep the command/${args_no_hyphens} structure.
+# =============================================================================
 
+program: agents/rl/train_ppo.py    # NOTE: PPO agents use train_ppo.py
+project: BeerGame_Research
+# entity: your-wandb-username
+
+method: bayes
+
+metric:
+  name: Avg_Cost_50
+  goal: minimize
+
+run_cap: 40
+
+# ---- Early-terminate IS allowed for the PPO family --------------------------
+# Unlike QMIX, PPO converges monotonically here, so Hyperband can safely kill
+# clearly-bad configs early and save GCP budget. min_iter keeps it from judging
+# before the warm-up (1000) + a margin has passed. Comment out if you prefer
+# every run to finish.
+early_terminate:
+  type: hyperband
+  min_iter: 2000                   # don't consider termination before ~episode 2000
+  eta: 3
+
+parameters:
+
+  # ACTOR LR. 3e-4 is the standard PPO value and worked; bracket it.
+  agent.lr_actor:
+    values: [0.0001, 0.0003, 0.0005]
+
+  # ENTROPY COEF. This is the knob that keeps the comm tokens diverse (it's WHY
+  # comm_mappo never collapsed while comm_qmix needed a penalty). Too low risks
+  # collapse; too high keeps the policy random. 0.1 worked; probe around it.
+  agent.entropy_coef:
+    values: [0.05, 0.1, 0.2]
+
+  # *** VOCAB ABLATION -- mirror of the comm_qmix axis for a clean cross-family
+  # comparison. vocab=1 = no-information channel = the no-comm control for the
+  # PPO family. comm_mappo(1) should fall back toward mappo (~26k). ***
+  agent.vocab_size:
+    values: [1, 3, 5]
+
+  # COMM PENALTY. Tiny in the working recipe (1e-4). Probe a small range; only
+  # has effect because it is passed as a Hydra override (see note at top).
+  agent.comm_penalty_coef:
+    values: [0.0001, 0.001, 0.01]
+
+  # LR SCHEDULER DECAY. gamma=0.5 halved the LR twice over 5k (-> 7e-5, possibly
+  # freezing the actor). gamma=1.0 disables decay entirely -- include it to test
+  # whether the decay was hurting late-stage learning.
+  agent.lr_scheduler_gamma:
+    values: [0.5, 1.0]
+
+# ---- Fixed run-control -------------------------------------------------------
 command:
-  - venv/Scripts/python.exe
+  - ${env}
+  - ${interpreter}
   - ${program}
   - agent=comm_mappo
+  - total_episodes=10000
+  - seed=42
+  - agent.warm_up_episodes=1000
+  - agent.patience=2000
+  - agent.reward_scale=100         # CRITICAL: 100, never 1000
   - ${args_no_hyphens}
+
+# -----------------------------------------------------------------------------
+# Phase-2 multi-seed confirmation: switch to method: grid, vary only
+# seed [42,123,2024], pin the winning hyperparameters, report mean +/- std.
+#
+# LAUNCH:  wandb sweep sweep_comm_mappo.yaml  ->  wandb agent <SWEEP_ID>
+# =============================================================================

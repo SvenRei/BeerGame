@@ -296,11 +296,13 @@ class MAPPOTrainer:
         for _ in range(self.k_epochs):
             if self.algo == "comm_mappo":
                 comm_actions_seq = torch.stack(buffer.comm_actions).detach()
-                
-                # Notice we drop comm_in_seq entirely.
-                # Call the new BPTT unroll on the MAC (self.actor), NOT the inner base actor.
-                act_log_probs, comm_log_probs, entropy = self.actor.evaluate_actions_bptt(
-                    obs_seq, hidden_0, actions_seq, comm_actions_seq
+                comm_in_seq = torch.stack(buffer.comm_in).detach()  # [T, N, 1] actual rollout messages
+
+                # Batched recurrent eval conditioned on the messages that ACTUALLY flowed
+                # during rollout. One GRU call over the whole sequence instead of a T-step
+                # loop. self.actor is the MAC; self.actor.actor is the CommMAPPOActor.
+                act_log_probs, comm_log_probs, _comm_probs, entropy = self.actor.actor.evaluate_actions(
+                    obs_seq, comm_in_seq, hidden_0, actions_seq, comm_actions_seq
                 )
                 current_log_probs_seq = act_log_probs + comm_log_probs.unsqueeze(-1)
             else:

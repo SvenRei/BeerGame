@@ -110,7 +110,7 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
 
     q_tot_flat = q_tot.reshape(B * T, 1)
     targets = b_rewards.reshape(B * T, 1) + cfg.agent.gamma * (1.0 - b_dones.reshape(B * T, 1)) * target_q_tot.reshape(B * T, 1)
-    loss = nn.SmoothL1Loss()(q_tot_flat, targets.detach())
+    loss = nn.MSELoss()(q_tot_flat, targets.detach())
 
     optimizer.zero_grad()
     loss.backward()

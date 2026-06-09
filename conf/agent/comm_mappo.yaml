@@ -9,9 +9,9 @@ k_epochs: 4
 eps_clip: 0.1
 entropy_coef: 0.10
 max_grad_norm: 0.2
-comm_penalty_coef: 0.0
+comm_penalty_coef: 0.0001
 warm_up_episodes: 1000
-patience: 2000
+patience: 800
 reward_scale: 100
 lr_scheduler_step: 2000
 lr_scheduler_gamma: 0.5

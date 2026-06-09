@@ -1,22 +1,73 @@
-program: scripts/train_ppo.py
-method: bayes
-metric:
-  goal: minimize
-  name: Avg_Cost_50
-parameters:
-  agent.lr_actor:
-    values: [0.00005, 0.0001, 0.0003, 0.001]
-  agent.lr_critic:
-    values: [0.0001, 0.0005, 0.001, 0.003]
-  agent.k_epochs:
-    values: [4, 10, 15]
-  agent.eps_clip:
-    values: [0.1, 0.2, 0.3]
-  agent.entropy_coef:
-    values: [0.01, 0.05, 0.1]
+# =============================================================================
+# W&B SWEEP  --  mappo   (PPO family, NO communication, CENTRALIZED critic)
+# =============================================================================
+# Role: the no-comm control for the PPO family. comm_mappo minus mappo = value
+# of communication within PPO. Status at 5k: HEALTHY, converged ~26.1k.
+#
+# Mechanics identical to the other files: Hydra CLI overrides via `command` +
+# ${args_no_hyphens}; dotted names (agent.*) keep Hydra as the source of truth.
+# =============================================================================
 
+program: agents/rl/train_ppo.py
+project: BeerGame_Research
+# entity: your-wandb-username
+
+method: bayes
+
+metric:
+  name: Avg_Cost_50
+  goal: minimize
+
+run_cap: 40
+
+# PPO converges monotonically -> Hyperband is safe (saves budget). See comm_mappo
+# file for rationale. Comment out to let every run finish.
+early_terminate:
+  type: hyperband
+  min_iter: 2000
+  eta: 3
+
+parameters:
+
+  # ACTOR LR -- bracket the working 3e-4.
+  agent.lr_actor:
+    values: [0.0001, 0.0003, 0.0005]
+
+  # CRITIC LR -- the centralized value function. 1e-3 worked; probe a range, as
+  # critic fit quality drives advantage quality (we saw transient critic-loss
+  # spikes to ~95k that settled to ~660 -- a better critic LR may smooth that).
+  agent.lr_critic:
+    values: [0.0005, 0.001, 0.003]
+
+  # ENTROPY COEF -- exploration / policy sharpness.
+  agent.entropy_coef:
+    values: [0.05, 0.1, 0.2]
+
+  # PPO CLIP -- trust-region width. 0.1 was used; 0.2 is the classic default.
+  agent.eps_clip:
+    values: [0.1, 0.2]
+
+  # LR SCHEDULER DECAY -- same concern as comm_mappo: gamma=0.5 froze the actor
+  # toward 7e-5. Include 1.0 (no decay) to test it.
+  agent.lr_scheduler_gamma:
+    values: [0.5, 1.0]
+
+# ---- Fixed run-control -------------------------------------------------------
 command:
-  - venv/Scripts/python.exe
+  - ${env}
+  - ${interpreter}
   - ${program}
   - agent=mappo
+  - total_episodes=10000
+  - seed=42
+  - agent.warm_up_episodes=1000
+  - agent.patience=2000
+  - agent.reward_scale=100
   - ${args_no_hyphens}
+
+# -----------------------------------------------------------------------------
+# Phase-2 multi-seed confirmation: method: grid, seed [42,123,2024] only, pin the
+# winning hyperparameters, report mean +/- std.
+#
+# LAUNCH:  wandb sweep sweep_mappo.yaml  ->  wandb agent <SWEEP_ID>
+# =============================================================================

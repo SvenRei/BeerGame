@@ -12,6 +12,12 @@ env/
 # Project Artifacts
 wandb/
 outputs/
+tests/
+weights_mappo/
+weights_comm_mappo/
+weights_qmix/
+weights_comm_qmix/
+weights_ippo/
 *.pth
 *.log
 .DS_Store
