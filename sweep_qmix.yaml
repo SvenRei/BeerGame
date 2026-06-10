@@ -46,6 +46,12 @@ parameters:
   agent.batch_size:
     values: [32, 64, 128]
 
+  # ACTION PARAMETERIZATION -- the structural fix for chronic over-ordering.
+  #   absolute -> shrunk/capped order space (abs_cap=40, 21 bins)
+  #   centered -> "d+x" rule: order = observed_demand + x, x in [-10,+10]
+  agent.action_mode:
+    values: ["absolute", "centered"]
+
 # ---- Fixed run-control -------------------------------------------------------
 command:
   - ${env}

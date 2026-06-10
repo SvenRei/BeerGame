@@ -1,12 +1,18 @@
 algorithm: "ippo"
 hidden_dim: 256
-n_actions: 101
+# Action space -- see agents/action_space.py (kept consistent with the in-scope agents).
+n_actions: 21
+action_mode: "absolute"
+abs_cap: 40
+centered_range: 10
 lr_actor: 3e-4
 lr_critic: 1e-3
 gamma: 0.99
 k_epochs: 4
 eps_clip: 0.1
-entropy_coef: 0.10
+entropy_coef: 0.02
+entropy_coef_end: 0.0
+entropy_anneal_frac: 0.5
 max_grad_norm: 0.2
 warm_up_episodes: 1000
 patience: 2000

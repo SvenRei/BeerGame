@@ -51,7 +51,7 @@ parameters:
   # comm_mappo never collapsed while comm_qmix needed a penalty). Too low risks
   # collapse; too high keeps the policy random. 0.1 worked; probe around it.
   agent.entropy_coef:
-    values: [0.05, 0.1, 0.2]
+    values: [0.0, 0.01, 0.03]   # start value, annealed to 0; lowered after the over-ordering fix
 
   # *** VOCAB ABLATION -- mirror of the comm_qmix axis for a clean cross-family
   # comparison. vocab=1 = no-information channel = the no-comm control for the
@@ -69,6 +69,10 @@ parameters:
   # whether the decay was hurting late-stage learning.
   agent.lr_scheduler_gamma:
     values: [0.5, 1.0]
+
+  # ACTION PARAMETERIZATION -- structural fix for over-ordering (see agents/action_space.py).
+  agent.action_mode:
+    values: ["absolute", "centered"]
 
 # ---- Fixed run-control -------------------------------------------------------
 command:

@@ -88,6 +88,10 @@ parameters:
   agent.target_update_freq:
     values: [200, 600]
 
+  # ACTION PARAMETERIZATION -- structural fix for over-ordering (see agents/action_space.py).
+  agent.action_mode:
+    values: ["absolute", "centered"]
+
 # ---- Fixed run-control (passed as literal Hydra overrides, NOT swept) -------
 command:
   - ${env}

@@ -1,6 +1,10 @@
 algorithm: "comm_qmix"
 hidden_dim: 256
-n_actions: 101
+# Action space -- see agents/action_space.py (21 actions; was 101 -> chronic over-ordering).
+n_actions: 21
+action_mode: "absolute"   # swept over {absolute, centered}
+abs_cap: 40               # absolute mode: effective max order
+centered_range: 10        # centered mode: x in [-10, +10]
 vocab_size: 3  # <-- Added for the hyperparameter sweep (1, 3, 5)
 mixing_embed_dim: 256
 hypernet_embed: 64

@@ -39,9 +39,11 @@ parameters:
   agent.lr_critic:
     values: [0.0005, 0.001, 0.003]
 
-  # ENTROPY COEF -- exploration / policy sharpness.
+  # ENTROPY COEF (start value; annealed to entropy_coef_end=0 over half of training).
+  # The old 0.05-0.2 range pinned a 101-way head near-uniform (-> order ~50, chronic
+  # over-ordering). With the smaller 21-way head these low values let the policy sharpen.
   agent.entropy_coef:
-    values: [0.05, 0.1, 0.2]
+    values: [0.0, 0.01, 0.03]
 
   # PPO CLIP -- trust-region width. 0.1 was used; 0.2 is the classic default.
   agent.eps_clip:
@@ -51,6 +53,10 @@ parameters:
   # toward 7e-5. Include 1.0 (no decay) to test it.
   agent.lr_scheduler_gamma:
     values: [0.5, 1.0]
+
+  # ACTION PARAMETERIZATION -- structural fix for over-ordering (see agents/action_space.py).
+  agent.action_mode:
+    values: ["absolute", "centered"]
 
 # ---- Fixed run-control -------------------------------------------------------
 command:

@@ -107,6 +107,9 @@ class BeerGameParallelEnv(ParallelEnv):
             self.stochastic_demand_cache[2] = self._roll_stochastic_demand(2)
 
         self.current_incoming_order = {a: 0 for a in self.possible_agents}
+        # Per-period Type-2 service (fill-rate) accounting, exposed via step()'s info dict.
+        self._period_demand = {a: 0 for a in self.possible_agents}
+        self._period_demand_met = {a: 0 for a in self.possible_agents}
         return {a: self._build_obs(a) for a in self.agents}, {a: {} for a in self.agents}
 
     def get_global_state(self):
@@ -215,10 +218,16 @@ class BeerGameParallelEnv(ParallelEnv):
                 if requests > 0:
                     self.shipment_pipelines[agent].add_shipment(self.current_step, requests, lead_time=2)
 
-            total_req = current_demand + self.backlog[agent]
+            backlog_prev = self.backlog[agent]
+            total_req = current_demand + backlog_prev
             fulfilled = min(self.inventory[agent], total_req)
             self.inventory[agent] -= fulfilled
             self.backlog[agent] = total_req - fulfilled
+
+            # Type-2 service (fill rate): of THIS period's new demand, how much is met
+            # immediately. Existing backlog is honored first; the remainder serves new demand.
+            self._period_demand[agent] = current_demand
+            self._period_demand_met[agent] = max(0, min(current_demand, fulfilled - backlog_prev))
 
             if agent != "retailer" and fulfilled > 0:
                 delay = self.np_random.integers(1, 10) if self._config.get("jittery_lead_time", False) else 2 
@@ -247,7 +256,9 @@ class BeerGameParallelEnv(ParallelEnv):
         for agent in self.agents:
             cost = (self.h * self.inventory[agent]) + (self.b * self.backlog[agent])
             total_system_cost += cost
-            infos[agent] = {"local_cost": cost}
+            infos[agent] = {"local_cost": cost,
+                            "demand": self._period_demand[agent],
+                            "demand_met": self._period_demand_met[agent]}
 
         for agent in self.agents:
             rewards[agent] = -total_system_cost

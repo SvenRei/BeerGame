@@ -31,6 +31,7 @@ def _torch_save(obj, path, _retries=6, _delay=5):
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
+from agents.action_space import index_to_fraction
 from agents.rl.mappo import (
     MAPPOActor,
     CommMAPPOActor,
@@ -92,6 +93,11 @@ def main(cfg: DictConfig):
     n_actions = cfg.agent.get("n_actions", 21)
     if n_actions < 2:
         raise ValueError(f"n_actions must be >= 2, got {n_actions}")
+
+    # Action parameterization (see agents/action_space.py). Swept over {absolute, centered}.
+    action_mode = cfg.agent.get("action_mode", "absolute")
+    abs_cap = cfg.agent.get("abs_cap", env.max_order)
+    centered_range = cfg.agent.get("centered_range", 10)
 
     if algo == "comm_mappo":
         vocab_size = cfg.agent.get("vocab_size", 3)
@@ -173,7 +179,15 @@ def main(cfg: DictConfig):
                     msg_in_buffer = torch.zeros(num_agents, 1, device=device)
                     comm_acts_buffer = torch.zeros(num_agents, 1, dtype=torch.long, device=device)
 
-            acts = {a: [actions_val[0, i, 0].cpu().item() / (n_actions - 1)] for i, a in enumerate(current_agents)}
+            acts = {
+                a: [index_to_fraction(
+                    int(actions_val[0, i, 0].cpu().item()),
+                    n_actions=n_actions, max_order=env.max_order, mode=action_mode,
+                    abs_cap=abs_cap, centered_range=centered_range,
+                    demand_anchor=float(obs[a][3]),
+                )]
+                for i, a in enumerate(current_agents)
+            }
 
             if env.current_step % 10 == 0:
                 order_quantities = {a: float(np.round(acts[a][0] * env.max_order)) for a in current_agents}

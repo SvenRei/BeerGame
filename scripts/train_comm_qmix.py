@@ -33,6 +33,7 @@ def _torch_save(obj, path, _retries=6, _delay=5):
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
+from agents.action_space import index_to_fraction
 from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer
 
 
@@ -163,6 +164,12 @@ def main(cfg: DictConfig):
     n_actions = cfg.agent.n_actions
     if n_actions < 2:
         raise ValueError(f"n_actions must be >= 2, got {n_actions}")
+
+    # Action parameterization (see agents/action_space.py). Swept over {absolute, centered}.
+    action_mode = cfg.agent.get("action_mode", "absolute")
+    abs_cap = cfg.agent.get("abs_cap", env.max_order)
+    centered_range = cfg.agent.get("centered_range", 10)
+
     hidden_dim = cfg.agent.hidden_dim
     num_agents = len(env.possible_agents)
     agent_names = env.possible_agents
@@ -225,7 +232,10 @@ def main(cfg: DictConfig):
                 else:
                     action_idx = q_vals[0, i].argmax(dim=-1).item()
                 actions_list.append([action_idx])
-                env_acts[a] = [action_idx / (n_actions - 1)]
+                env_acts[a] = [index_to_fraction(
+                    action_idx, n_actions=n_actions, max_order=env.max_order, mode=action_mode,
+                    abs_cap=abs_cap, centered_range=centered_range, demand_anchor=float(obs[a][3]),
+                )]
 
             if env.current_step % 10 == 0:
                 wandb.log({f"Order_Qty/{a}": float(np.round(env_acts[a][0] * env.max_order)) for a in agent_names}, commit=False)

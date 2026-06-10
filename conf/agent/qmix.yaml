@@ -6,10 +6,18 @@ algorithm: "qmix"
 # Size of the hidden memory state (GRU) for the local agents
 hidden_dim: 256
 
-# --- FIX 1: INCREASED GRANULARITY ---
-# Increased from 21 to 51. The agent can now step in increments of 2 units.
-# This prevents the agent from hiding in a "safe" 10-unit wide bin.
-n_actions: 101
+# --- ACTION SPACE (see agents/action_space.py) ---
+# 21 discrete actions. The old 101-way space spanned orders 0..100 while demand is
+# only ~8, so epsilon-greedy / diffuse policies averaged an order of ~50 and the
+# agents chronically over-ordered (200+ units of inventory). 21 actions is the sweet
+# spot for both parameterizations below.
+n_actions: 21
+# action_mode is swept over {absolute, centered}:
+#   absolute -> order = round(idx/(n_actions-1) * abs_cap)  (capped, shrunk range)
+#   centered -> order = clip(observed_demand + (idx - centered_range), 0, max_order)  (d+x rule)
+action_mode: "absolute"
+abs_cap: 40          # absolute mode: effective max order (idx step = abs_cap/(n_actions-1) = 2)
+centered_range: 10   # centered mode: x in [-10, +10]; n_actions == 2*centered_range+1
 
 # Internal embedding size for the central mixing network
 mixing_embed_dim: 256

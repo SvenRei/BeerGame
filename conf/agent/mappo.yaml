@@ -1,12 +1,20 @@
 algorithm: "mappo"
 hidden_dim: 256
-n_actions: 101
+# Action space -- see agents/action_space.py (21 actions; was 101 -> chronic over-ordering).
+n_actions: 21
+action_mode: "absolute"   # swept over {absolute, centered}
+abs_cap: 40               # absolute mode: effective max order
+centered_range: 10        # centered mode: x in [-10, +10]
 lr_actor: 3e-4
 lr_critic: 1e-3
 gamma: 0.99
 k_epochs: 4
 eps_clip: 0.1
-entropy_coef: 0.10
+# Entropy: 0.10 on a 101-way head pinned the policy near-uniform (expected order ~50).
+# Lowered to 0.02 and annealed to 0 so the policy can sharpen onto the right order.
+entropy_coef: 0.02
+entropy_coef_end: 0.0     # anneal target
+entropy_anneal_frac: 0.5  # fraction of total_episodes over which to anneal start->end
 max_grad_norm: 0.2
 warm_up_episodes: 1000
 patience: 2000
