@@ -69,7 +69,7 @@ parameters:
   # Gumbel tau anneals 1.0 -> 0.1 over this many episodes (message discreteness).
   # Consider also adding a value >= total_episodes to test slow-decay vs collapse.
   agent.tau_decay_episodes:
-    values: [2500, 5000, 7500]
+    values: [2500, 5000, 7500, 10000, 15000]
 
 # ---- Fixed run-control (literal Hydra overrides, all keys exist) -------------
 command:

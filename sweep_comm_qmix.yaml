@@ -74,7 +74,7 @@ parameters:
   # value >= total_episodes (e.g. 15000) to test whether slow decay keeps the
   # channel diverse.
   agent.tau_decay_episodes:
-    values: [2500, 5000, 7500]
+    values: [2500, 5000, 7500, 10000, 15000]
 
   # Rescales the TD target only (NOT the logged cost). Stays <= 100 ("never 1000").
   agent.reward_scale:
