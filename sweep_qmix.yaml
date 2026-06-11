@@ -23,7 +23,7 @@ metric:
   name: Avg_Cost_50
   goal: minimize
 
-run_cap: 30                        # smaller space than comm_qmix -> fewer runs needed
+run_cap: 40                        # smaller space than comm_qmix -> fewer runs needed
 
 # early_terminate intentionally OFF for the QMIX family (noisy; slow-starters
 # can recover -- see the comm_qmix file for the evidence).
