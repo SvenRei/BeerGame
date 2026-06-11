@@ -60,7 +60,7 @@ command:
   - agent=qmix
   - hydra.job.chdir=False      # FIX 2: Stop Hydra from changing directories
   - hydra.output_subdir=null   # FIX 2: Disable writing .hydra configs to disk  
-  - total_episodes=10000
+  - total_episodes=15000
   - seed=42
   - agent.warm_up_episodes=1000
   - agent.patience=2000

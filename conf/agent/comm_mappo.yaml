@@ -1,6 +1,6 @@
 algorithm: "comm_mappo"
 hidden_dim: 256
-vocab_size: 3  # <-- Added for the hyperparameter sweep (1, 3, 5)
+vocab_size: 3  # supported values: 1 (no-comm control), 3, 5  (see comm_utils.get_vocab_tensor)
 # Action space -- see agents/action_space.py (21 actions; was 101 -> chronic over-ordering).
 n_actions: 21
 action_mode: "absolute"   # swept over {absolute, centered}
@@ -17,6 +17,7 @@ entropy_coef_end: 0.0     # anneal target
 entropy_anneal_frac: 0.5  # fraction of total_episodes over which to anneal start->end
 max_grad_norm: 0.2
 comm_penalty_coef: 0.0001
+tau_decay_episodes: 7500   # ADDED: Gumbel tau 1.0 -> 0.1 over this many episodes; swept in sweep_comm_mappo.yaml
 warm_up_episodes: 1000
 patience: 800
 reward_scale: 100

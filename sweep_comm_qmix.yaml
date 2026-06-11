@@ -1,149 +1,106 @@
 # =============================================================================
-# W&B SWEEP  --  comm_qmix   (THE CURRENT WINNER: ~7.4k Avg_Cost_50 at 5k eps)
+# W&B SWEEP  --  comm_qmix   (QMIX family WITH communication)
 # =============================================================================
-# This is your most important sweep. comm_qmix is ~3.4x better than the next
-# agent, so the highest-value tuning happens here. The vocab_size axis below is
-# arguably your single most important SCIENTIFIC result (see its comment).
+# CORRECTED. Changes that make this sweep actually launch (the previous version
+# crashed on 100% of trials):
+#   * vocab_size: [2,3,5,7] -> [1,3,5].
+#       get_vocab_tensor() only supports 1/3/5; vocab=2 and vocab=7 raise
+#       ValueError on the first forward. vocab=1 is NOT blocked -- it is the
+#       information-free NO-COMM control (CommQMixLocalAgent short-circuits it to
+#       a constant-zero message). 1 vs 3 vs 5 IS the headline ablation.
+#   * removed agent.entropy_coef.
+#       QMIX has no policy-entropy term and the key is absent from
+#       conf/agent/comm_qmix.yaml, so Hydra aborted at composition every trial.
+#   * removed the duplicate pinned `agent.reward_scale=100` from `command`.
+#       reward_scale is swept below; ${args_no_hyphens} ran last and overrode the
+#       pinned value anyway, so the pinned line was dead and misleading.
+#   * agent.tau_decay_episodes is swept -> REQUIRES the new key in
+#       conf/agent/comm_qmix.yaml  (add:  tau_decay_episodes: 7500).
+#       Without that one line, Hydra aborts at composition again.
 #
-# -----------------------------------------------------------------------------
-# HOW PARAMETERS REACH THE CODE  (read this once -- it's the same in all 5 files)
-# -----------------------------------------------------------------------------
-# We do NOT rely on wandb.config injection. Instead the `command:` block below
-# passes every swept parameter as a HYDRA OVERRIDE on the command line, e.g.
-#       agent.lr=0.001 agent.vocab_size=3 ...
-# Why: train_qmix.py / train_ppo.py compose config via Hydra. Hydra applying a
-# CLI override is the single source of truth. (train_ppo.py's open_dict block
-# only reads a FIXED allow-list from wandb.config and does NOT include
-# comm_penalty_coef or target_update_freq -- so the wandb.config route would
-# silently drop them. The Hydra-override route works for ALL keys.)
-#
-# Because we name parameters with their full dotted path (agent.lr, not lr),
-# the wandb.config allow-list check (`if "lr" in wandb.config`) never fires, so
-# there is no double-application. Hydra's value stands. This is intentional.
-#
-# Note on prefixes (mirror the manual CLI commands you already ran):
-#   * top-level keys  -> NO prefix:  total_episodes, seed
-#   * agent keys      -> agent.*  :  agent.lr, agent.warm_up_episodes, ...
+# MECHANICS: params reach the code as Hydra CLI overrides via `command` +
+# ${args_no_hyphens} (dotted agent.* names). Every swept/fixed key below now
+# EXISTS in comm_qmix.yaml, so composition succeeds and the value is read by
+# scripts/train_comm_qmix.py. No train-script or agent-code change is required.
 # =============================================================================
 
-program: scripts/train_comm_qmix.py  # path RELATIVE to where you run `wandb agent`
-                                   # (launch from repo root) -- or use an absolute path.
-project: BeerGame_Research         # must match wandb.init(project=...) in the code
-# entity: your-wandb-username      # uncomment + set to your wandb user/team
+program: scripts/train_comm_qmix.py
+project: BeerGame_Research
+# entity: your-wandb-username
 
-method: bayes                      # Bayesian search. Do NOT use grid here: the full
-                                   # grid (lr x vocab x penalty x target) is 54 combos
-                                   # x 3 seeds = 162 runs. Bayes finds good regions fast.
+method: bayes
 
-# ---- Optimization target ----------------------------------------------------
 metric:
-  name: Avg_Cost_50                # the smoothed 50-episode mean cost (logged every ep)
-  goal: minimize                   # lower cost = better
-  # NOTE: W&B optimizes the run's SUMMARY value of this metric (= last logged
-  # value by default). For converged comm_qmix runs the last 50-ep average is
-  # stable (last500 mean 7430 vs last 7526), so last-value is a fine proxy.
+  name: Avg_Cost_50
+  goal: minimize
+  # NB: both train scripts define this metric with summary="min", so the sweep
+  # optimizes the BEST 50-ep average over the run. For high-variance QMIX that
+  # can reward a lucky transient dip -- confirm winners with the Phase-2 seeds.
 
-run_cap: 40                        # stop the whole sweep after 40 runs. Bump if the
-                                   # search hasn't plateaued. Protects your GCP budget.
+run_cap: 40
+# SPACE SIZE: lr(3) x vocab(3) x comm_penalty(3) x target(2) x action_mode(2)
+#   x tau_decay(3) x reward_scale(3) x lr_sched(2)  ~= 1900 combinations.
+# 40 Bayes runs cover ~2% of that. Either raise run_cap or drop low-value axes.
+# First to drop if you need to trim:
+#   - reward_scale (redundant with lr for gradient scale; does NOT affect the
+#     logged Avg_Cost_50 -- it only rescales the TD target), and
+#   - action_mode (a structural choice; cleaner to run the two modes as separate
+#     sweeps so each can find its own lr).
 
-# ---- DO NOT early-terminate QMIX --------------------------------------------
-# Hyperband would kill "slow starters". But your OWN comm_qmix run DIPPED to
-# ~47k at ~10% of training, then RECOVERED to 7k. Hyperband at min_iter~1000
-# would have murdered the eventual winner. So early_terminate stays OFF for the
-# QMIX family. (It's enabled for the PPO family, which converges monotonically.)
-# early_terminate:
-#   type: hyperband
-#   min_iter: 3000
+# early_terminate intentionally OFF for the QMIX family: it is noisy and slow
+# starters can recover, so Hyperband would risk killing an eventual winner.
 
-# ---- Swept hyperparameters --------------------------------------------------
 parameters:
 
-  # LEARNING RATE. 1e-3 won at 5k; 5e-4 was tested and underperformed. We bracket
-  # the winner and probe slightly higher. (Reverting Huber->MSE is what fixed
-  # QMIX; this LR range assumes MSE is in the code -- confirm before launching.)
   agent.lr:
     values: [0.0005, 0.001, 0.002]
 
-  # *** THE HEADLINE ABLATION ***
-  # vocab_size = number of discrete communication tokens.
-  #   1 -> a 1-symbol "vocabulary" carries ZERO information = the NO-COMM control.
-  #        This is your clean ablation: comm_qmix(vocab=1) should collapse toward
-  #        vanilla qmix (~29k). The gap between vocab=1 and vocab=3/5 IS the
-  #        measured value of communication. This single axis answers
-  #        "does communication help, and how much vocabulary does it need?"
-  #   3 -> the configuration that produced your 7.4k winner.
-  #   5 -> tests whether a richer vocabulary buys anything beyond 3.
+  # *** HEADLINE ABLATION ***  1 = info-free no-comm control, 3 = working, 5 = richer.
   agent.vocab_size:
     values: [1, 3, 5]
 
-  # COMMUNICATION PENALTY. At 5k, penalty=0.0 did NOT collapse (tokens held 3.0),
-  # so 0.0 is a legitimate setting here. We still probe small positive values in
-  # case longer 10k training drifts toward collapse. With vocab=1 this is moot.
   agent.comm_penalty_coef:
     values: [0.0, 0.001, 0.01]
 
-  # TARGET-NETWORK refresh (in env steps). Vanilla qmix was noisy at 200; a less
-  # frequent target update can stabilize the bootstrap. comm_qmix was stable at
-  # 200, but we let Bayes explore whether 600 helps the 10k run.
+  # NOTE: counted in EPISODES in the code (ep % target_update_freq), NOT env steps.
   agent.target_update_freq:
     values: [200, 600]
 
-  # ACTION PARAMETERIZATION -- structural fix for over-ordering (see agents/action_space.py).
   agent.action_mode:
     values: ["absolute", "centered"]
 
-# ---- Fixed run-control (passed as literal Hydra overrides, NOT swept) -------
+  # Gumbel tau anneals 1.0 -> 0.1 over this many episodes. This is the main lever
+  # against token collapse. With total_episodes=15000, consider also adding a
+  # value >= total_episodes (e.g. 15000) to test whether slow decay keeps the
+  # channel diverse.
+  agent.tau_decay_episodes:
+    values: [2500, 5000, 7500]
+
+  # Rescales the TD target only (NOT the logged cost). Stays <= 100 ("never 1000").
+  agent.reward_scale:
+    values: [10, 50, 100]
+
+  agent.lr_scheduler_gamma:
+    values: [0.5, 1.0]
+
+# ---- Fixed run-control (literal Hydra overrides, all keys exist) -------------
 command:
   - ${env}
   - ${interpreter}
   - ${program}
-  - agent=comm_qmix            # selects conf/agent/comm_qmix.yaml (the Hydra group)
-  - hydra.job.chdir=False      # FIX 2: Stop Hydra from changing directories
-  - hydra.output_subdir=null   # FIX 2: Disable writing .hydra configs to disk
-  - total_episodes=10000       # longer than the 5k diagnostic: these numbers go in the thesis
-  - seed=42                    # FIXED during search (see multi-seed note at bottom)
-  - agent.warm_up_episodes=1000  # production warm-up (fills replay buffer)
-  - agent.patience=2000        # re-enable early-stop so good configs end & save budget
-  - agent.reward_scale=100     # CRITICAL: 100, never 1000 (1000 caused the divergence)
-  - agent.epsilon_decay_episodes=5000  # gentle exploration anneal over 10k eps
-  - ${args_no_hyphens}         # <-- the swept params land here as agent.lr=... etc.
+  - agent=comm_qmix
+  - hydra.job.chdir=False
+  - hydra.output_subdir=null
+  - total_episodes=15000
+  - seed=42
+  - agent.warm_up_episodes=1000
+  - agent.patience=2000
+  - agent.epsilon_decay_episodes=5000
+  - ${args_no_hyphens}
 
-# =============================================================================
-# MULTI-SEED CONFIRMATION (Phase 2) -- do this AFTER the search picks a winner
-# =============================================================================
-# Single-seed search finds the region; it does NOT give error bars. QMIX variance
-# is large (qmix swung 16k-82k), so a reviewer will demand seed averaging.
-# Once you have the best config, run a SMALL grid sweep over seeds only:
-#
-#   method: grid
-#   parameters:
-#     seed:
-#       values: [42, 123, 2024]
-#   command:
-#     - ${env}
-#     - ${interpreter}
-#     - ${program}
-#     - agent=comm_qmix
-#     - total_episodes=10000
-#     - agent.warm_up_episodes=1000
-#     - agent.patience=2000
-#     - agent.reward_scale=100
-#     - agent.epsilon_decay_episodes=5000
-#     - agent.lr=<BEST>                 # paste the winning values here
-#     - agent.vocab_size=<BEST>
-#     - agent.comm_penalty_coef=<BEST>
-#     - agent.target_update_freq=<BEST>
-#     - ${args_no_hyphens}
-#
-# Then report mean +/- std over the 3 seeds. (Do NOT put seed in a `bayes` sweep
-# -- optimizing over seed is statistically meaningless.)
-#
 # -----------------------------------------------------------------------------
-# LAUNCH (GCP):
-#   1) From repo root:           wandb sweep sweep_comm_qmix.yaml
-#      -> prints a SWEEP_ID like: your-entity/BeerGame_Research/abc123
-#   2) On each GCP VM/worker:    wandb agent your-entity/BeerGame_Research/abc123
-#      Run the agent on several VMs in parallel; they all pull from one sweep.
-#   3) If Hydra writes runs into outputs/DATE/TIME subdirs and that bothers you,
-#      add `hydra.job.chdir=False` to the command list (Hydra >= 1.1 only).
+# Phase-2 multi-seed confirmation: method: grid, vary only seed [42,123,2024],
+# pin the winning hyperparameters in `command`, report mean +/- std.
+#
+# LAUNCH:  wandb sweep sweep_comm_qmix.yaml  ->  wandb agent <SWEEP_ID>
 # =============================================================================
