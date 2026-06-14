@@ -8,6 +8,32 @@ except ImportError:  # Allows direct smoke tests from this file's folder.
     from comm_utils import get_vocab_tensor
 
 
+class MessageDecoder(nn.Module):
+    """NDQ expressiveness head (Wang et al., ICLR 2020, Eq. 3/7).
+
+    A shared variational posterior q_xi(a_j | o_j, m_in_j) that predicts the
+    RECEIVER's action from the receiver's own observation plus the INCOMING
+    message. Trained with cross-entropy against the receiver's (detached)
+    greedy action. Because the gradient w.r.t. m_in_j flows back into the
+    sender's msg_stream (messages are differentiable during training), this
+    pushes the channel to carry information that is predictive of the
+    receiver's decision. A constant message cannot lower this loss below the
+    obs-only baseline, so -- unlike a pure CIC/KL listening bonus -- it cannot
+    be satisfied by a collapsed single-token channel.
+    """
+
+    def __init__(self, obs_dim, n_actions, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + 1, hidden), nn.ReLU(),
+            nn.Linear(hidden, n_actions),
+        )
+
+    def forward(self, obs, msg_in):
+        # obs: [..., obs_dim] (already scaled), msg_in: [..., 1]
+        return self.net(torch.cat([obs, msg_in], dim=-1))
+
+
 class QMixLocalAgent(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_actions):
         super(QMixLocalAgent, self).__init__()
@@ -35,13 +61,13 @@ class CommQMixLocalAgent(nn.Module):
         self.vocab_size = vocab_size
 
         self.obs_encoder = nn.Linear(input_dim, hidden_dim // 2)
-        self.msg_encoder = nn.Linear(1, hidden_dim // 2)
+        self.msg_encoder = nn.Linear(2, hidden_dim // 2)
         self.rnn = nn.GRUCell(hidden_dim, hidden_dim)
         self.value_stream = nn.Linear(hidden_dim, 1)
         self.advantage_stream = nn.Linear(hidden_dim, n_actions)
         self.msg_stream = nn.Linear(hidden_dim, vocab_size)
 
-    def forward(self, obs, msg_in, hidden, tau=1.0, hard=True):
+    def forward(self, obs, msg_in, hidden, tau=1.0, hard=True, sample=True):
         scaled_obs = obs / 100.0
         obs_feat = F.relu(self.obs_encoder(scaled_obs))
         msg_feat = F.relu(self.msg_encoder(msg_in))
@@ -59,10 +85,11 @@ class CommQMixLocalAgent(nn.Module):
             msg_indices = torch.zeros(h.size(0), 1, dtype=torch.long, device=obs.device)
         else:
             msg_logits = self.msg_stream(h)
-            msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=hard)
-            vocab = get_vocab_tensor(self.vocab_size, obs.device)
-            msg_out = (msg_probs * vocab).sum(dim=-1, keepdim=True)
-            msg_indices = msg_probs.argmax(dim=-1, keepdim=True)
+            if sample:
+                msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=hard)
+            else:  # deterministic eval: argmax, no Gumbel noise
+                idx = msg_logits.argmax(dim=-1, keepdim=True)
+                msg_probs = torch.zeros_like(msg_logits).scatter_(-1, idx, 1.0)
 
         return q_vals, msg_out, msg_indices, h
 
@@ -102,7 +129,12 @@ class QMixCommMAC(nn.Module):
                     self.msg_buffer = torch.zeros(B, self.num_agents, 1, device=obs.device)
                 current_msgs = self.msg_buffer
 
-        masked_msgs = torch.matmul(self.adj_mask, current_msgs)
+        Bq = current_msgs.size(0); dev = current_msgs.device
+        down = torch.zeros(Bq, self.num_agents, 1, device=dev)
+        up   = torch.zeros(Bq, self.num_agents, 1, device=dev)
+        down[:, 1:, :] = current_msgs[:, :-1, :]   # message from downstream neighbour (i-1)
+        up[:,  :-1, :] = current_msgs[:, 1:,  :]   # message from upstream neighbour  (i+1)
+        masked_msgs = torch.cat([down, up], dim=-1)   # [B, N, 2]
         obs_flat = obs.reshape(B * self.num_agents, -1)
         msg_flat = masked_msgs.reshape(B * self.num_agents, -1)
         hiddens_flat = hiddens.reshape(B * self.num_agents, -1)
@@ -117,6 +149,11 @@ class QMixCommMAC(nn.Module):
             else:
                 self.msg_buffer = msg_out_reshaped.detach()
 
+        # NEW: also return the per-agent INCOMING message (after adjacency routing).
+        # In training (explicit msg, soft Gumbel) this tensor is differentiable and
+        # carries gradient back to the sender's msg_stream -- needed for the NDQ
+        # expressiveness loss.
+        self.last_incoming_msgs = masked_msgs.reshape(B, self.num_agents, 1)
         return q_vals.reshape(B, self.num_agents, -1), next_hiddens.reshape(B, self.num_agents, -1), msg_out_reshaped, safe_logs
 
 

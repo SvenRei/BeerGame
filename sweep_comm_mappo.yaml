@@ -75,7 +75,7 @@ parameters:
 
   # Episodes over which Gumbel tau anneals 1.0 -> tau_min.
   agent.tau_decay_episodes:
-    values: [2500, 7500, 15000]
+    values: [2500, 7500, 8000, 10000, 15000]
 
   # Temperature floor: 0.1 = prior near-discrete behavior; 0.5 = soft channel.
   agent.tau_min:

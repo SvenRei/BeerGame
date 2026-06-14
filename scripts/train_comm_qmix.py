@@ -34,7 +34,7 @@ def _torch_save(obj, path, _retries=6, _delay=5):
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.action_space import index_to_fraction
-from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer
+from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer, MessageDecoder
 
 
 class EpisodeReplayBuffer:
@@ -67,7 +67,7 @@ def set_global_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all_params, cfg, device, hidden_dim, tau):
+def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all_params, cfg, device, hidden_dim, tau, msg_decoder=None):
     b_states = batch["states"].to(device)
     b_obs = batch["obs"].to(device)
     b_actions = batch["actions"].to(device)
@@ -84,17 +84,19 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
 
     q_evals_list, target_q_evals_list = [], []
     msg_out_list = []
+    inc_msg_list = []  # NEW: incoming (post-adjacency) message per agent, per step
 
     # Online network: hard=False keeps Gumbel-softmax differentiable so gradients
     # flow back through msg_stream. Target network runs inside no_grad.
     for t in range(T_plus_1):
-        q_t, h_train, msg_out, _ = mac(b_obs[:, t], h_train, tau=tau, msg_in=msg_in, hard=False)
+        q_t, h_train, msg_out, _, inc_msg = mac(b_obs[:, t], h_train, tau=tau, msg_in=msg_in, hard=False)
         msg_in = msg_out  # keep gradient flow through communication
         q_evals_list.append(q_t)
         msg_out_list.append(msg_out)
+        inc_msg_list.append(inc_msg)  # [B, N, 1], differentiable -> sender's msg_stream
 
         with torch.no_grad():
-            target_q_t, target_h_train, target_msg_out, _ = target_mac(b_obs[:, t], target_h_train, tau=tau, msg_in=target_msg_in, hard=False)
+            target_q_t, target_h_train, target_msg_out, _, _ = target_mac(b_obs[:, t], target_h_train, tau=tau, msg_in=target_msg_in, hard=False)
             target_msg_in = target_msg_out
             target_q_evals_list.append(target_q_t)
 
@@ -118,31 +120,38 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
     comm_penalty = cfg.agent.comm_penalty_coef * (msg_outs_tensor ** 2).mean()
 
     listening_coef = cfg.agent.get("listening_coef", 0.0)
-    listening_kl = torch.tensor(0.0, device=device)
-    if listening_coef > 0.0 and cfg.agent.get("vocab_size", 3) > 1:
-        # Deaf counterfactual: full re-roll with zero incoming messages.
-        # no_grad => fixed reference; the model CANNOT satisfy the objective by
-        # degrading its message-free policy, only by making messages matter.
+    # ------------------------------------------------------------------
+    # NDQ EXPRESSIVENESS ("listening") LOSS  (Wang et al., ICLR 2020, Eq. 3/7)
+    #
+    # We REPLACE the old CIC/KL positive-listening bonus. That objective rewarded
+    # ANY divergence between the with-message and zero-message policy, so a
+    # CONSTANT (information-free) message could maximise it -> single-token
+    # collapse. Here instead we train a shared decoder q_xi(a_j | o_j, m_in_j) to
+    # predict the receiver's greedy action from its own obs + the incoming
+    # message, and minimise the cross-entropy. The gradient w.r.t. the incoming
+    # message flows into the sender's msg_stream, so the channel is pushed to
+    # carry receiver-decision-relevant information. A constant message cannot
+    # beat the obs-only baseline, so this is NOT gameable by collapse.
+    #
+    # NOTE: in QMIX the mixer already sees the global state, so the TD loss alone
+    # gives ~0 gradient to the message head (messages are redundant for fitting
+    # Q_tot). This decentralised auxiliary loss is what actually trains the channel.
+    # ------------------------------------------------------------------
+    expr_loss = torch.tensor(0.0, device=device)
+    if listening_coef > 0.0 and cfg.agent.get("vocab_size", 3) > 1 and msg_decoder is not None:
+        inc_msgs = torch.stack(inc_msg_list, dim=1)[:, :-1]      # [B, T, N, 1] differentiable
+        obs_scaled = b_obs[:, :-1] / 100.0                       # [B, T, N, obs] (match agent's /100 scaling)
+        logits = msg_decoder(obs_scaled, inc_msgs)              # [B, T, N, A]
         with torch.no_grad():
-            h_cf = torch.zeros(B, N, hidden_dim, device=device)
-            zero_msg = torch.zeros(B, N, 1, device=device)
-            q_cf_list = []
-            for t in range(T):
-                q_cf, h_cf, _, _ = mac(b_obs[:, t], h_cf, tau=tau, msg_in=zero_msg, hard=False)
-                q_cf_list.append(q_cf)
-            q_cf_seq = torch.stack(q_cf_list, dim=1)            # [B, T, N, A]
-        # Boltzmann policies over Q. Dueling head: softmax(V+A-mean(A)) cancels V,
-        # so this KL responds only to advantage SHAPE -- it cannot be inflated by
-        # growing value magnitudes.
-        pi_true = torch.softmax(q_evals[:, :-1], dim=-1)        # grad flows back via messages
-        pi_deaf = torch.softmax(q_cf_seq, dim=-1)               # detached reference
-        kl = (pi_true * (torch.log(pi_true + 1e-8) - torch.log(pi_deaf + 1e-8))).sum(-1)
-        # Cap per-step KL: we want "messages matter", not "maximize divergence forever".
-        kl = kl.clamp(max=float(cfg.agent.get("listening_kl_clip", 2.0)))
-        listening_kl = kl.mean()
+            # p(A_j | .) proxy: receiver's own informed (with-message) greedy action.
+            teacher = q_evals[:, :-1].argmax(dim=-1)            # [B, T, N]
+        A = logits.size(-1)
+        expr_loss = nn.functional.cross_entropy(
+            logits.reshape(-1, A), teacher.reshape(-1)
+        )
 
-    # Subtract: maximizing listening_kl == rewarding message influence on policy.
-    loss = base_loss + comm_penalty - listening_coef * listening_kl
+    # Minimise expressiveness CE (note: + sign, unlike the old maximised KL term).
+    loss = base_loss + comm_penalty + listening_coef * expr_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -155,7 +164,7 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
 
     torch.nn.utils.clip_grad_norm_(all_params, 5.0)
     optimizer.step()
-    return loss.item(), msg_grad_norm, float(listening_kl.detach().item())
+    return loss.item(), msg_grad_norm, float(expr_loss.detach().item())
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
@@ -211,7 +220,12 @@ def main(cfg: DictConfig):
     target_mac.load_state_dict(mac.state_dict())
     target_mixer.load_state_dict(mixer.state_dict())
 
-    all_params = list(mixer.parameters()) + list(mac.parameters())
+    # NDQ expressiveness decoder q_xi(a_j | o_j, m_in_j). Shared across agents
+    # (like NDQ's shared variational posterior). Trained jointly via the optimizer.
+    expr_decoder_hidden = cfg.agent.get("expr_decoder_hidden", 128)
+    msg_decoder = MessageDecoder(local_dim, n_actions, hidden=expr_decoder_hidden).to(device)
+
+    all_params = list(mixer.parameters()) + list(mac.parameters()) + list(msg_decoder.parameters())
     optimizer = optim.Adam(all_params, lr=cfg.agent.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg.agent.lr_scheduler_step, gamma=cfg.agent.lr_scheduler_gamma)
     buffer = EpisodeReplayBuffer(cfg.agent.buffer_size)
@@ -249,7 +263,7 @@ def main(cfg: DictConfig):
             obs_tensor = torch.tensor(obs_array, dtype=torch.float32, device=device).unsqueeze(0)
 
             with torch.no_grad():
-                q_vals, next_hiddens, _, safe_logs = mac(obs_tensor, hiddens_tensor.detach(), tau=tau)
+                q_vals, next_hiddens, _, safe_logs, _ = mac(obs_tensor, hiddens_tensor.detach(), tau=tau)
                 episode_messages.append(safe_logs)
 
             env_acts, actions_list = {}, []
@@ -297,7 +311,7 @@ def main(cfg: DictConfig):
             for _ in range(updates_per_episode):
                 batch = buffer.sample(cfg.agent.batch_size)
                 last_loss, last_msg_grad_norm, last_listening_kl = update_comm_qmix(
-                    batch, mac, target_mac, mixer, target_mixer, optimizer, all_params, cfg, device, hidden_dim, tau
+                    batch, mac, target_mac, mixer, target_mixer, optimizer, all_params, cfg, device, hidden_dim, tau, msg_decoder=msg_decoder
                 )
 
             if ep % cfg.agent.target_update_freq == 0 and ep > 0:
@@ -321,7 +335,8 @@ def main(cfg: DictConfig):
             "LR": scheduler.get_last_lr()[0],
             "Loss": last_loss,
             "Comm/Msg_Grad_Norm": last_msg_grad_norm,
-              "Comm/Listening_KL": last_listening_kl
+            "Comm/Listening_KL": last_listening_kl,        # now holds the NDQ expressiveness CE (lower = better)
+            "Comm/Expressiveness_CE": last_listening_kl
         }
         for a, cost in ep_agent_costs.items():
             log_dict[f"Cost/{a}"] = cost

@@ -152,7 +152,7 @@ def rollout_with_condition(policy, env, seed, condition, record_states=False):
             if policy.name == "comm_qmix":
                 # explicit msg_in: MAC consumes it and does NOT touch its own
                 # rollout state -- we own the message state entirely.
-                q, next_h, msg_out, safe_logs = mac(o, policy.h, tau=policy.eval_tau,
+                q, next_h, msg_out, safe_logs, _ = mac(o, policy.h, tau=policy.eval_tau,
                                                     msg_in=fed, hard=True)
                 head = q
             else:                              # comm_mappo: MAC reads self.msg_buffer
@@ -250,7 +250,7 @@ def _action_probs(policy, mac, o, h, fed):
     WITHOUT advancing any state (hidden/message buffers restored by caller)."""
     with torch.no_grad():
         if policy.name == "comm_qmix":
-            q, _h, _m, _l = mac(o, h, tau=policy.eval_tau, msg_in=fed, hard=True)
+            q, _h, _m, _l, _inc  = mac(o, h, tau=policy.eval_tau, msg_in=fed, hard=True)
             return torch.softmax(q[0], dim=-1)            # Boltzmann(Q, T=1): a distance proxy
         saved = mac.msg_buffer.clone() if mac.msg_buffer is not None else None
         mac.msg_buffer = fed.clone()
@@ -291,7 +291,7 @@ def test3_influence(policy, env, vocab_values):
             # advance the episode normally (intact channel)
             with torch.no_grad():
                 if policy.name == "comm_qmix":
-                    q, next_h, msg_out, _ = mac(o, policy.h, tau=policy.eval_tau,
+                    q, next_h, msg_out, _, _  = mac(o, policy.h, tau=policy.eval_tau,
                                                 msg_in=true_msgs, hard=True)
                     head = q
                 else:

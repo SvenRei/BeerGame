@@ -82,7 +82,7 @@ parameters:
   # Episodes over which Gumbel tau anneals tau_start(1.0) -> tau_min.
   # 15000 = anneal spans the whole run (tau reaches the floor only at the end).
   agent.tau_decay_episodes:
-    values: [2500, 7500, 15000]
+    values: [2500, 7500, 8000, 10000, 15000]
 
   # Temperature floor. 0.1 = near-discrete late-training messages (prior
   # behavior); 0.5 = permanently soft channel, the literature-typical regime.

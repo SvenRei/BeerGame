@@ -25,5 +25,13 @@ reward_scale: 100
 lr_scheduler_step: 2000
 lr_scheduler_gamma: 0.5
 tau_min: 0.1   # Gumbel temperature floor; swept in the comm sweeps
-listening_coef: 0.0     # weight of the positive-listening KL bonus. 0.0 = exactly current behavior.
-listening_kl_clip: 2.0  # per-step cap (nats) on the maximized KL; prevents unbounded divergence-chasing.
+# --- NDQ expressiveness ("listening") loss (Wang et al., ICLR 2020) ---------
+# Weight on the cross-entropy that trains a shared decoder q_xi(a_j|o_j,m_in_j)
+# to predict the receiver's action from its obs + incoming message. >0 enables
+# it (requires vocab_size>1). This REPLACES the old CIC/KL positive-listening
+# bonus, which was gameable by a constant message (single-token collapse).
+# Start ~0.1-0.5; sweep this axis.
+listening_coef: 0.2
+expr_decoder_hidden: 128
+# DEPRECATED: kept only for config/back-compat; no longer used by the loss.
+listening_kl_clip: 2.0
