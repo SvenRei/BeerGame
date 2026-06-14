@@ -24,3 +24,6 @@ updates_per_episode: 1
 reward_scale: 100
 lr_scheduler_step: 2000
 lr_scheduler_gamma: 0.5
+tau_min: 0.1   # Gumbel temperature floor; swept in the comm sweeps
+listening_coef: 0.0     # weight of the positive-listening KL bonus. 0.0 = exactly current behavior.
+listening_kl_clip: 2.0  # per-step cap (nats) on the maximized KL; prevents unbounded divergence-chasing.

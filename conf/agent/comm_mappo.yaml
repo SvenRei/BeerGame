@@ -23,3 +23,4 @@ patience: 800
 reward_scale: 100
 lr_scheduler_step: 2000
 lr_scheduler_gamma: 0.5
+tau_min: 0.1   # Gumbel temperature floor; swept in the comm sweeps

@@ -1,16 +1,23 @@
 # =============================================================================
-# W&B SWEEP  --  qmix   (vanilla QMIX, NO communication baseline)
+# W&B SWEEP -- qmix  (vanilla QMIX: the NO-COMMUNICATION control, QMIX family)
 # =============================================================================
-# Role: the no-comm control for the QMIX family. comm_qmix(vocab>=3) minus qmix
-# is the value of communication within the value-learning family.
+# DESIGN PRINCIPLE (applies to all four sweep files): within each algorithm
+# family, the no-comm control and the comm variant sweep IDENTICAL shared axes;
+# the comm variant adds only communication-specific axes (vocab_size,
+# comm_penalty_coef, tau_decay_episodes, tau_min). This removes the tuning-
+# opportunity confound: any qmix-vs-comm_qmix difference cannot be explained by
+# one arm having had access to hyperparameters the other did not.
 #
-# Status from the 5k diagnostic: qmix LEARNS but is UNSTABLE -- best ~21k, final
-# ~29k, and cost swung wildly (16k-82k) across the run. So this sweep targets
-# STABILITY (target-update rate, batch size, lr), not just raw lr.
+# SHARED AXES for the QMIX family (identical here and in sweep_comm_qmix.yaml):
+#   lr, target_update_freq, batch_size, action_mode, lr_scheduler_gamma
+# PINNED in both (identical values, stated in the paper):
+#   reward_scale=100, warm_up=1000, patience=2000, epsilon_decay=5000, seed=42
 #
-# Mechanics identical to sweep_comm_qmix.yaml: params are passed as HYDRA CLI
-# overrides via `command` + ${args_no_hyphens}; dotted names (agent.*) bypass
-# train_qmix.py's wandb.config handling so every key actually takes effect.
+# OPTIMIZATION METRIC: Avg_Cost_500 (trailing 500-episode mean of system cost,
+# logged every episode; the sweep reads its LAST value = converged performance).
+# We deliberately do NOT optimize min(Avg_Cost_50): a 50-episode minimum rewards
+# transient noise dips, which the QMIX family produces in abundance.
+# Requires the Avg_Cost_500 logging patch in scripts/train_qmix.py.
 # =============================================================================
 
 program: scripts/train_qmix.py
@@ -20,46 +27,46 @@ project: BeerGame_Research
 method: bayes
 
 metric:
-  name: Avg_Cost_50
+  name: Avg_Cost_500
   goal: minimize
 
-run_cap: 40                        # smaller space than comm_qmix -> fewer runs needed
+run_cap: 30   # space = 3*2*2*2*2 = 48 combos / 5 dims; 30 Bayes runs is adequate.
 
-# early_terminate intentionally OFF for the QMIX family (noisy; slow-starters
-# can recover -- see the comm_qmix file for the evidence).
+# early_terminate intentionally OFF for the QMIX family: high variance means
+# slow starters can recover; Hyperband would risk culling eventual winners.
 
 parameters:
 
-  # LEARNING RATE -- bracket the value that won at 5k (1e-3).
+  # Learning rate: brackets the diagnostic winner (1e-3). Range consistent with
+  # Adam-based QMIX practice (Rashid et al. 2018 use 5e-4 with RMSprop).
   agent.lr:
     values: [0.0005, 0.001, 0.002]
 
-  # TARGET-NETWORK refresh (env steps). This is the prime suspect for qmix's
-  # instability: refreshing every 200 steps makes the online net chase a
-  # fast-moving target. Less frequent updates (600/1000) often stabilize QMIX.
+  # Target-network refresh, counted in EPISODES (code: `ep % target_update_freq`).
+  # 200 episodes matches Rashid et al.; 600 tests a slower-moving bootstrap
+  # target as the stability lever.
   agent.target_update_freq:
-    values: [200, 600, 1000]
+    values: [200, 600]
 
-  # BATCH SIZE off the replay buffer. Larger batches reduce gradient variance,
-  # which directly attacks the 16k-82k swing we observed. buffer_size is 5000,
-  # so 128 is still well-supported.
+  # Replay batch (episodes per gradient step). 32 matches Rashid et al.; 64
+  # halves gradient variance, directly targeting the observed cost swings.
   agent.batch_size:
-    values: [32, 64, 128]
+    values: [32, 64]
 
-  # ACTION PARAMETERIZATION -- the structural fix for chronic over-ordering.
-  #   absolute -> shrunk/capped order space (abs_cap=40, 21 bins)
-  #   centered -> "d+x" rule: order = observed_demand + x, x in [-10,+10]
+  # Action parameterization: capped absolute orders vs the "d+x" rule
+  # (Oroojlooyjadid et al. 2022). A structural axis, reported separately.
   agent.action_mode:
     values: ["absolute", "centered"]
 
-# ---- Fixed run-control -------------------------------------------------------
+ 
+# ---- Fixed run-control (identical to sweep_comm_qmix.yaml) -------------------
 command:
   - ${env}
   - ${interpreter}
   - ${program}
   - agent=qmix
-  - hydra.job.chdir=False      # FIX 2: Stop Hydra from changing directories
-  - hydra.output_subdir=null   # FIX 2: Disable writing .hydra configs to disk  
+  - hydra.job.chdir=False
+  - hydra.output_subdir=null
   - total_episodes=15000
   - seed=42
   - agent.warm_up_episodes=1000
@@ -67,11 +74,8 @@ command:
   - agent.reward_scale=100
   - agent.epsilon_decay_episodes=5000
   - ${args_no_hyphens}
-
-# -----------------------------------------------------------------------------
-# Phase-2 multi-seed confirmation: same recipe as the comm_qmix file -- switch to
-# method: grid, vary only seed [42,123,2024], pin the winning hyperparameters in
-# the command, report mean +/- std.
-#
+  - agent.lr_scheduler_gamma=1.0
+# Phase 2 (after the search): grid over seed [42,123,2024,7,1009] at the winning
+# config; report IQM and bootstrap CIs (Agarwal et al. 2021) on Avg_Cost_500.
 # LAUNCH:  wandb sweep sweep_qmix.yaml  ->  wandb agent <SWEEP_ID>
 # =============================================================================

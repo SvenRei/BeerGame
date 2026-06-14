@@ -117,7 +117,32 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
     msg_outs_tensor = torch.stack(msg_out_list, dim=1) # Shape: [B, T+1, N, 1]
     comm_penalty = cfg.agent.comm_penalty_coef * (msg_outs_tensor ** 2).mean()
 
-    loss = base_loss + comm_penalty
+    listening_coef = cfg.agent.get("listening_coef", 0.0)
+    listening_kl = torch.tensor(0.0, device=device)
+    if listening_coef > 0.0 and cfg.agent.get("vocab_size", 3) > 1:
+        # Deaf counterfactual: full re-roll with zero incoming messages.
+        # no_grad => fixed reference; the model CANNOT satisfy the objective by
+        # degrading its message-free policy, only by making messages matter.
+        with torch.no_grad():
+            h_cf = torch.zeros(B, N, hidden_dim, device=device)
+            zero_msg = torch.zeros(B, N, 1, device=device)
+            q_cf_list = []
+            for t in range(T):
+                q_cf, h_cf, _, _ = mac(b_obs[:, t], h_cf, tau=tau, msg_in=zero_msg, hard=False)
+                q_cf_list.append(q_cf)
+            q_cf_seq = torch.stack(q_cf_list, dim=1)            # [B, T, N, A]
+        # Boltzmann policies over Q. Dueling head: softmax(V+A-mean(A)) cancels V,
+        # so this KL responds only to advantage SHAPE -- it cannot be inflated by
+        # growing value magnitudes.
+        pi_true = torch.softmax(q_evals[:, :-1], dim=-1)        # grad flows back via messages
+        pi_deaf = torch.softmax(q_cf_seq, dim=-1)               # detached reference
+        kl = (pi_true * (torch.log(pi_true + 1e-8) - torch.log(pi_deaf + 1e-8))).sum(-1)
+        # Cap per-step KL: we want "messages matter", not "maximize divergence forever".
+        kl = kl.clamp(max=float(cfg.agent.get("listening_kl_clip", 2.0)))
+        listening_kl = kl.mean()
+
+    # Subtract: maximizing listening_kl == rewarding message influence on policy.
+    loss = base_loss + comm_penalty - listening_coef * listening_kl
 
     optimizer.zero_grad()
     loss.backward()
@@ -130,7 +155,7 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
 
     torch.nn.utils.clip_grad_norm_(all_params, 5.0)
     optimizer.step()
-    return loss.item(), msg_grad_norm
+    return loss.item(), msg_grad_norm, float(listening_kl.detach().item())
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
@@ -142,6 +167,7 @@ def main(cfg: DictConfig):
     # Sweep optimizes the run summary of Avg_Cost_50; take the BEST (min) over the run,
     # not the noisy last value (critical for the high-variance QMIX family).
     wandb.define_metric("Avg_Cost_50", summary="min")
+    wandb.define_metric("Avg_Cost_500", summary="last")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -194,11 +220,12 @@ def main(cfg: DictConfig):
     warm_up = cfg.agent.get("warm_up_episodes", 1000)
     eps_decay_eps = cfg.agent.get("epsilon_decay_episodes", 5000)
     cost_history = deque(maxlen=50)
+    cost_history_500 = deque(maxlen=500)
     best_avg_cost, since_imp, global_step = float("inf"), 0, 0
     epsilon = cfg.agent.epsilon_start
-    last_loss, last_msg_grad_norm = 0.0, 0.0
+    last_loss, last_msg_grad_norm, last_listening_kl = 0.0, 0.0, 0.0
 
-    tau_start, tau_min = 1.0, 0.1
+    tau_start, tau_min = 1.0, cfg.agent.get("tau_min", 0.1)
     tau_decay_episodes = cfg.agent.get("tau_decay_episodes", cfg.total_episodes * 0.5)
 
     print("--- Starting COMM_QMIX Sequence Replay Training ---")
@@ -269,7 +296,7 @@ def main(cfg: DictConfig):
             updates_per_episode = cfg.agent.get("updates_per_episode", 1)
             for _ in range(updates_per_episode):
                 batch = buffer.sample(cfg.agent.batch_size)
-                last_loss, last_msg_grad_norm = update_comm_qmix(
+                last_loss, last_msg_grad_norm, last_listening_kl = update_comm_qmix(
                     batch, mac, target_mac, mixer, target_mixer, optimizer, all_params, cfg, device, hidden_dim, tau
                 )
 
@@ -282,15 +309,19 @@ def main(cfg: DictConfig):
         epsilon = max(cfg.agent.epsilon_end, cfg.agent.epsilon_start - decay_step * (ep + 1))
 
         cost_history.append(ep_cost)
+        cost_history_500.append(ep_cost)
+        avg_cost_500 = sum(cost_history_500) / len(cost_history_500)
         avg_cost = sum(cost_history) / len(cost_history)
         log_dict = {
             "Cost": ep_cost,
             "Avg_Cost_50": avg_cost,
+            "Avg_Cost_500": avg_cost_500,
             "Epsilon": epsilon,
             "Tau": tau,
             "LR": scheduler.get_last_lr()[0],
             "Loss": last_loss,
             "Comm/Msg_Grad_Norm": last_msg_grad_norm,
+              "Comm/Listening_KL": last_listening_kl
         }
         for a, cost in ep_agent_costs.items():
             log_dict[f"Cost/{a}"] = cost

@@ -129,6 +129,7 @@ def main(cfg: DictConfig):
     # Sweep optimizes the run summary of Avg_Cost_50; take the BEST (min) over the run,
     # not the noisy last value (critical for the high-variance QMIX family).
     wandb.define_metric("Avg_Cost_50", summary="min")
+    wandb.define_metric("Avg_Cost_500", summary="last")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -172,6 +173,7 @@ def main(cfg: DictConfig):
     warm_up = cfg.agent.get("warm_up_episodes", 1000)
     eps_decay_eps = cfg.agent.get("epsilon_decay_episodes", 5000)
     cost_history = deque(maxlen=50)
+    cost_history_500 = deque(maxlen=500)
     best_avg_cost, since_imp, global_step = float("inf"), 0, 0
     epsilon = cfg.agent.epsilon_start
     last_loss = 0.0
@@ -234,7 +236,7 @@ def main(cfg: DictConfig):
 
         buffer.push(ep_states, ep_obs, ep_actions, ep_rewards, ep_dones)
 
-        if len(buffer) > cfg.agent.batch_size:
+        if len(buffer) >= cfg.agent.batch_size and ep >= warm_up:
             updates_per_episode = cfg.agent.get("updates_per_episode", 1)
             for _ in range(updates_per_episode):
                 batch = buffer.sample(cfg.agent.batch_size)
@@ -250,8 +252,10 @@ def main(cfg: DictConfig):
         epsilon = max(cfg.agent.epsilon_end, cfg.agent.epsilon_start - decay_step * (ep + 1))
 
         cost_history.append(ep_cost)
+        cost_history_500.append(ep_cost)
+        avg_cost_500 = sum(cost_history_500) / len(cost_history_500)
         avg_cost = sum(cost_history) / len(cost_history)
-        log_dict = {"Cost": ep_cost, "Avg_Cost_50": avg_cost, "Epsilon": epsilon, "LR": scheduler.get_last_lr()[0], "Loss": last_loss}
+        log_dict = {"Cost": ep_cost, "Avg_Cost_50": avg_cost, "Avg_Cost_500": avg_cost_500, "Epsilon": epsilon, "LR": scheduler.get_last_lr()[0], "Loss": last_loss}
         for a, cost in ep_agent_costs.items():
             log_dict[f"Cost/{a}"] = cost
         wandb.log(log_dict)

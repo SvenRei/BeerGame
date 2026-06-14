@@ -1,11 +1,23 @@
 # =============================================================================
-# W&B SWEEP  --  mappo   (PPO family, NO communication, CENTRALIZED critic)
+# W&B SWEEP -- mappo  (PPO family: the NO-COMMUNICATION control, centralized critic)
 # =============================================================================
-# Role: the no-comm control for the PPO family. comm_mappo minus mappo = value
-# of communication within PPO. Status at 5k: HEALTHY, converged ~26.1k.
+# DESIGN: shared axes are IDENTICAL to sweep_comm_mappo.yaml (lr_actor,
+# entropy_coef, action_mode, lr_scheduler_gamma) so mappo-vs-comm_mappo is not
+# confounded by unequal tuning opportunity.
 #
-# Mechanics identical to the other files: Hydra CLI overrides via `command` +
-# ${args_no_hyphens}; dotted names (agent.*) keep Hydra as the source of truth.
+# To keep the equalized space tractable, two former axes are now PINNED at the
+# same literature-standard values in BOTH PPO sweeps:
+#   eps_clip = 0.1   (conservative end of the standard 0.1-0.2 range;
+#                     the diagnostic runs used 0.1 successfully)
+#   lr_critic = 1e-3 (the value used in all healthy diagnostic runs)
+# Pinning identically in both arms preserves comparison validity; sweeping them
+# in only one arm would not.
+#
+# METRIC: Avg_Cost_500 (trailing 500-ep mean, last value). This replaces
+# optimizing min(Avg_Cost_50), which rewards transient dips -- the comm_mappo
+# diagnostic dipped to ~695 at ep4455 and finished at ~1600, exactly the
+# failure mode a min-summary would have selected for.
+# Requires the Avg_Cost_500 logging patch in scripts/train_ppo.py.
 # =============================================================================
 
 program: scripts/train_ppo.py
@@ -15,67 +27,59 @@ project: BeerGame_Research
 method: bayes
 
 metric:
-  name: Avg_Cost_50
+  name: Avg_Cost_500
   goal: minimize
 
-run_cap: 40
+run_cap: 30   # space = 3*3*2*2 = 36 combos / 4 dims.
 
-# PPO converges monotonically -> Hyperband is safe (saves budget). See comm_mappo
-# file for rationale. Comment out to let every run finish.
+# Hyperband stays ON for the PPO family (approximately monotonic convergence);
+# min_iter=4000 gives every config warm-up (1000) plus 3000 learning episodes
+# before it can be culled, so late-paying entropy/LR schedules get a fair look.
 early_terminate:
   type: hyperband
-  min_iter: 2000
+  min_iter: 4000
   eta: 3
 
 parameters:
 
-  # ACTOR LR -- bracket the working 3e-4.
+  # ---- SHARED AXES (identical to sweep_comm_mappo.yaml) ----------------------
+  # Actor LR: brackets the PPO-standard 3e-4 (Schulman et al. 2017; Yu et al. 2021).
   agent.lr_actor:
     values: [0.0001, 0.0003, 0.0005]
 
-  # CRITIC LR -- the centralized value function. 1e-3 worked; probe a range, as
-  # critic fit quality drives advantage quality (we saw transient critic-loss
-  # spikes to ~95k that settled to ~660 -- a better critic LR may smooth that).
-  agent.lr_critic:
-    values: [0.0005, 0.001, 0.003]
-
-  # ENTROPY COEF (start value; annealed to entropy_coef_end=0 over half of training).
-  # The old 0.05-0.2 range pinned a 101-way head near-uniform (-> order ~50, chronic
-  # over-ordering). With the smaller 21-way head these low values let the policy sharpen.
+  # Entropy bonus start value (annealed to 0 over half of training).
+  # 0.01 is the MAPPO reference value; 0.0 is the no-exploration-bonus control.
   agent.entropy_coef:
     values: [0.0, 0.01, 0.03]
 
-  # PPO CLIP -- trust-region width. 0.1 was used; 0.2 is the classic default.
-  agent.eps_clip:
-    values: [0.1, 0.2]
-
-  # LR SCHEDULER DECAY -- same concern as comm_mappo: gamma=0.5 froze the actor
-  # toward 7e-5. Include 1.0 (no decay) to test it.
-  agent.lr_scheduler_gamma:
-    values: [0.5, 1.0]
-
-  # ACTION PARAMETERIZATION -- structural fix for over-ordering (see agents/action_space.py).
+  # Capped absolute orders vs the "d+x" rule (Oroojlooyjadid et al. 2022).
   agent.action_mode:
     values: ["absolute", "centered"]
 
-# ---- Fixed run-control -------------------------------------------------------
+  # LR decay: 0.5 halves LR every 2000 episodes; 1.0 disables decay. Included
+  # because the diagnostic showed both failure modes are plausible (frozen
+  # late learning at 0.5; late instability at 1.0).
+  agent.lr_scheduler_gamma:
+    values: [0.5, 1.0]
+
+# ---- Fixed run-control (identical to sweep_comm_mappo.yaml) -------------------
 command:
   - ${env}
   - ${interpreter}
   - ${program}
-  - hydra.job.chdir=False      # FIX 2: Stop Hydra from changing directories
-  - hydra.output_subdir=null   # FIX 2: Disable writing .hydra configs to disk  
   - agent=mappo
+  - hydra.job.chdir=False
+  - hydra.output_subdir=null
   - total_episodes=15000
   - seed=42
   - agent.warm_up_episodes=1000
   - agent.patience=2000
   - agent.reward_scale=100
+  - agent.lr_critic=0.001
+  - agent.eps_clip=0.1
   - ${args_no_hyphens}
 
-# -----------------------------------------------------------------------------
-# Phase-2 multi-seed confirmation: method: grid, seed [42,123,2024] only, pin the
-# winning hyperparameters, report mean +/- std.
-#
+# Phase 2: grid over seed [42,123,2024,7,1009] at the winning config; report
+# IQM + bootstrap CIs on Avg_Cost_500.
 # LAUNCH:  wandb sweep sweep_mappo.yaml  ->  wandb agent <SWEEP_ID>
 # =============================================================================

@@ -1,24 +1,31 @@
 # =============================================================================
-# W&B SWEEP  --  comm_mappo   (PPO family WITH communication)
+# W&B SWEEP -- comm_mappo  (PPO family WITH a learned discrete channel)
 # =============================================================================
-# CORRECTED. Changes that make this sweep actually launch (the previous version
-# crashed on 100% of trials):
-#   * vocab_size: [2,3,5,7] -> [1,3,5].
-#       get_vocab_tensor() only supports 1/3/5; vocab=2 and vocab=7 raise
-#       ValueError on the first forward. vocab=1 is the information-free NO-COMM
-#       control (1-logit comm head -> constant token). 1 vs 3 vs 5 = the
-#       value-of-communication ablation for the PPO family.
-#   * removed agent.epsilon_decay_episodes.
-#       PPO has NO epsilon-greedy. The key is absent from conf/agent/comm_mappo.yaml
-#       and unread by train_ppo.py, so Hydra aborted at composition every trial.
-#   * agent.tau_decay_episodes is swept -> REQUIRES the new key in
-#       conf/agent/comm_mappo.yaml  (add:  tau_decay_episodes: 7500).
+# DESIGN: shared axes are IDENTICAL to sweep_mappo.yaml (lr_actor, entropy_coef,
+# action_mode, lr_scheduler_gamma), with eps_clip=0.1 and lr_critic=1e-3 pinned
+# identically in both arms. On top of those, this sweep adds the four
+# communication-specific axes.
 #
-# entropy_coef IS meaningful here (the comm_head is a Categorical with an entropy
-# bonus), so sweeping it is the right anti-collapse lever for the PPO family --
-# unlike QMIX, which has no policy-entropy term.
+# HEADLINE ABLATION: vocab_size in {1, 3, 5}; vocab=1 is the information-free
+# within-architecture control (see sweep_comm_qmix.yaml header for the full
+# rationale -- the logic is identical and intentionally mirrored across
+# families, enabling the cross-family comparison of the SAME ablation).
 #
-# No train-script or agent-code change is required.
+# ANTI-COLLAPSE MECHANISMS available in the PPO family (unlike QMIX, which has
+# only the temperature schedule): the entropy bonus here covers BOTH the action
+# head and the message head (dist_comm), so entropy_coef directly rewards token
+# diversity -- the closest mechanism in this codebase to the positive-signalling
+# bias of Eccles et al. (2019). comm_penalty_coef is an L2 cost on the expected
+# message; with the symmetric vocabulary it is minimized by the 0-token, so it
+# prices communication rather than preventing collapse. The 0.0 control (newly
+# added; the previous file lacked it) makes the cost effect measurable.
+#
+# tau_min REQUIRES the one-line patch in agents/rl/mappo.py (MAPPOTrainer) and
+# the `tau_min: 0.1` key in conf/agent/comm_mappo.yaml (see the patch list).
+#
+# METRIC: Avg_Cost_500 (trailing 500-ep mean, last value) -- the comm_mappo
+# diagnostic's 695->1600 late blow-up is exactly why min(Avg_Cost_50) is not a
+# valid optimization target. Requires the logging patch in scripts/train_ppo.py.
 # =============================================================================
 
 program: scripts/train_ppo.py
@@ -28,50 +35,53 @@ project: BeerGame_Research
 method: bayes
 
 metric:
-  name: Avg_Cost_50
+  name: Avg_Cost_500
   goal: minimize
 
-run_cap: 40
-# SPACE SIZE: lr_actor(3) x entropy(3) x vocab(3) x comm_penalty(3) x lr_sched(2)
-#   x action_mode(2) x tau_decay(3)  ~= 970 combinations. 40 runs cover ~4%.
-# Trim or raise run_cap as needed.
+run_cap: 80   # space = 36 shared * (3*3*3*2) comm = 1944 combos / 8 dims.
+              # If budget forces a cut, drop tau_min (pin 0.1) and reduce to 60.
 
-# PPO is roughly monotonic here, so Hyperband can cull clearly-bad runs and save
-# budget. (comm_mappo did destabilize late in the 5k diagnostic; summary="min"
-# keeps the best checkpoint, and min_iter avoids judging before warm-up+margin.)
+# Hyperband ON (PPO family), min_iter=4000: warm-up + 3000 learning episodes
+# before any cull, so slow tau/entropy schedules are judged fairly.
 early_terminate:
   type: hyperband
-  min_iter: 2000
+  min_iter: 4000
   eta: 3
 
 parameters:
 
+  # ---- SHARED AXES (identical to sweep_mappo.yaml) ----------------------------
   agent.lr_actor:
     values: [0.0001, 0.0003, 0.0005]
 
-  # Token-diversity knob (start value, annealed to entropy_coef_end=0).
+  # Covers action AND message heads -- the PPO family's token-diversity lever.
   agent.entropy_coef:
     values: [0.0, 0.01, 0.03]
-
-  # *** HEADLINE ABLATION ***  1 = info-free no-comm control, 3 = working, 5 = richer.
-  agent.vocab_size:
-    values: [1, 3, 5]
-
-  agent.comm_penalty_coef:
-    values: [0.0001, 0.001, 0.01]
-
-  agent.lr_scheduler_gamma:
-    values: [0.5, 1.0]
 
   agent.action_mode:
     values: ["absolute", "centered"]
 
-  # Gumbel tau anneals 1.0 -> 0.1 over this many episodes (message discreteness).
-  # Consider also adding a value >= total_episodes to test slow-decay vs collapse.
-  agent.tau_decay_episodes:
-    values: [2500, 5000, 7500, 10000, 15000]
+  agent.lr_scheduler_gamma:
+    values: [0.5, 1.0]
 
-# ---- Fixed run-control (literal Hydra overrides, all keys exist) -------------
+  # ---- COMMUNICATION AXES (this sweep only) ----------------------------------
+  # 1 = info-free control | 3 = ternary channel | 5 = richer vocabulary.
+  agent.vocab_size:
+    values: [1, 3, 5]
+
+  # L2 cost on the expected message (0.0 = free channel control).
+  agent.comm_penalty_coef:
+    values: [0.0, 0.001, 0.01]
+
+  # Episodes over which Gumbel tau anneals 1.0 -> tau_min.
+  agent.tau_decay_episodes:
+    values: [2500, 7500, 15000]
+
+  # Temperature floor: 0.1 = prior near-discrete behavior; 0.5 = soft channel.
+  agent.tau_min:
+    values: [0.1, 0.5]
+
+# ---- Fixed run-control (identical to sweep_mappo.yaml) ------------------------
 command:
   - ${env}
   - ${interpreter}
@@ -84,11 +94,12 @@ command:
   - agent.warm_up_episodes=1000
   - agent.patience=2000
   - agent.reward_scale=100
+  - agent.lr_critic=0.001
+  - agent.eps_clip=0.1
   - ${args_no_hyphens}
 
-# -----------------------------------------------------------------------------
-# Phase-2 multi-seed confirmation: method: grid, vary only seed [42,123,2024],
-# pin the winning hyperparameters, report mean +/- std.
-#
+# Phase 2: grid over seed [42,123,2024,7,1009] at the winning config AND the
+# same config with vocab_size=1; the per-seed paired difference is the headline
+# statistic. Report IQM + bootstrap CIs on Avg_Cost_500.
 # LAUNCH:  wandb sweep sweep_comm_mappo.yaml  ->  wandb agent <SWEEP_ID>
 # =============================================================================

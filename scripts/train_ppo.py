@@ -65,6 +65,7 @@ def main(cfg: DictConfig):
     # Sweep optimizes the run summary of Avg_Cost_50; take the BEST (min) over the run,
     # not the noisy last value.
     wandb.define_metric("Avg_Cost_50", summary="min")
+    wandb.define_metric("Avg_Cost_500", summary="last")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -115,6 +116,7 @@ def main(cfg: DictConfig):
     patience = cfg.agent.get("patience", 500)
     warm_up = cfg.agent.get("warm_up_episodes", 1000)
     cost_history = deque(maxlen=50)
+    cost_history_500 = deque(maxlen=500)
     best_avg_cost = float("inf")
     since_imp = 0
 
@@ -240,11 +242,14 @@ def main(cfg: DictConfig):
             critic_scheduler.step()
 
         cost_history.append(ep_cost)
+        cost_history_500.append(ep_cost)
+        avg_cost_500 = sum(cost_history_500) / len(cost_history_500)
         avg_cost = sum(cost_history) / len(cost_history)
 
         log_dict = {
             "Cost": ep_cost,
             "Avg_Cost_50": avg_cost,
+            "Avg_Cost_500": avg_cost_500,
             "Actor_Loss": actor_loss,
             "Critic_Loss": critic_loss,
             "Actor_LR": actor_scheduler.get_last_lr()[0],

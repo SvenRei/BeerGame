@@ -235,7 +235,12 @@ class MAPPOTrainer:
     def __init__(self, actor, critic, cfg, total_episodes, device, algo):
         self.actor, self.critic, self.device, self.algo = actor, critic, device, algo
         self.gamma = cfg.get("gamma", 0.99)
+        # Entropy is annealed start->end over `entropy_anneal_frac` of training so the
+        # policy explores early then SHARPENS onto the right order (the diffuse high-mean
+        # over-ordering trap is exactly what a constant high entropy_coef sustained).
         self.entropy_coef = cfg.get("entropy_coef", 0.05)
+        self.entropy_coef_end = cfg.get("entropy_coef_end", self.entropy_coef)
+        self.entropy_anneal_episodes = max(1.0, cfg.get("entropy_anneal_frac", 1.0) * total_episodes)
         self.comm_penalty_coef = cfg.get("comm_penalty_coef", 0.0)
         self.k_epochs = cfg.get("k_epochs", 4)
 
@@ -245,7 +250,7 @@ class MAPPOTrainer:
         self.warm_up_episodes = cfg.get("warm_up_episodes", 1000)
         self.total_episodes = total_episodes
         self.tau_start = 1.0
-        self.tau_min = 0.1
+        self.tau_min = cfg.get("tau_min", 0.1)
         self.tau_decay_episodes = cfg.get("tau_decay_episodes", total_episodes * 0.5)
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.get("lr_actor", 3e-4))
@@ -290,6 +295,10 @@ class MAPPOTrainer:
         advantages_seq = returns - values_seq.detach()
         advantages_seq = (advantages_seq - advantages_seq.mean()) / (advantages_seq.std() + 1e-8)
 
+        # Linearly anneal the entropy coefficient from start -> end over training.
+        anneal_frac = min(1.0, current_ep / self.entropy_anneal_episodes)
+        entropy_coef = self.entropy_coef + (self.entropy_coef_end - self.entropy_coef) * anneal_frac
+
         actor_loss = torch.tensor(0.0, device=self.device)
         critic_loss = torch.tensor(0.0, device=self.device)
 
@@ -319,7 +328,7 @@ class MAPPOTrainer:
             ratios = torch.exp(current_log_probs_seq - old_log_probs_seq)
             surr1 = ratios * advantages_seq
             surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages_seq
-            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy + comm_penalty
+            actor_loss = -torch.min(surr1, surr2).mean() - entropy_coef * entropy + comm_penalty
 
             if self.algo == "ippo":
                 values_flat = self.critic(obs_seq.reshape(T * num_agents, -1))
