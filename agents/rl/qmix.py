@@ -12,14 +12,8 @@ class MessageDecoder(nn.Module):
     """NDQ expressiveness head (Wang et al., ICLR 2020, Eq. 3/7).
 
     Shared posterior q_xi(a_j | o_j, m_in_j): predicts the RECEIVER's action
-    from its own observation plus the INCOMING message, trained with
-    cross-entropy against the receiver's (detached) greedy action. Gradient
-    w.r.t. m_in_j flows back into the sender's msg_stream, so the channel is
-    pushed to carry receiver-decision-relevant information. A constant message
-    cannot beat the obs-only baseline -> not gameable by single-token collapse.
-
-    msg_dim must match the per-agent INCOMING width (2 with per-edge routing:
-    [downstream_slot, upstream_slot]).
+    from its own observation plus the INCOMING message. msg_dim must match the
+    per-agent INCOMING width (2 with per-edge routing).
     """
 
     def __init__(self, obs_dim, n_actions, msg_dim=2, hidden=128):
@@ -30,7 +24,6 @@ class MessageDecoder(nn.Module):
         )
 
     def forward(self, obs, msg_in):
-        # obs: [..., obs_dim] (scaled), msg_in: [..., msg_dim]
         return self.net(torch.cat([obs, msg_in], dim=-1))
 
 
@@ -69,12 +62,12 @@ class CommQMixLocalAgent(nn.Module):
         self.msg_stream = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, obs, msg_in, hidden, tau=1.0, hard=True, sample=True):
-        """
-        sample=True  : Gumbel-softmax sample (training/exploration). With
-                       hard=True this is straight-through: discrete forward
-                       (matches deployment), soft gradient through msg_stream.
-        sample=False : deterministic argmax token, no Gumbel noise (eval only;
-                       no gradient in this branch).
+        """Returns q_vals, msg_out (value), msg_indices, h, msg_dist.
+
+        msg_dist is the SOFT categorical p(m|tau) = softmax(logits). It is the
+        quantity the NDQ succinctness/IB term must use -- NOT the hard one-hot
+        Gumbel sample (whose entropy is always 0, making KL(.||uniform) a
+        constant log V with a noisy straight-through gradient).
         """
         scaled_obs = obs / 100.0
         obs_feat = F.relu(self.obs_encoder(scaled_obs))
@@ -89,10 +82,13 @@ class CommQMixLocalAgent(nn.Module):
         q_vals = V + A - A.mean(dim=1, keepdim=True)
 
         if self.vocab_size == 1:
+            # no-comm control: constant 0 token, degenerate 1-class distribution.
             msg_out = torch.zeros(h.size(0), 1, device=obs.device)
             msg_indices = torch.zeros(h.size(0), 1, dtype=torch.long, device=obs.device)
+            msg_dist = torch.ones(h.size(0), 1, device=obs.device)   # BUGFIX: was undefined
         else:
             msg_logits = self.msg_stream(h)
+            msg_dist = F.softmax(msg_logits, dim=-1)                 # SOFT p(m|tau) for the IB term
             if sample:
                 msg_probs = F.gumbel_softmax(msg_logits, tau=tau, hard=hard)
             else:  # deterministic eval: argmax, no Gumbel noise
@@ -102,7 +98,7 @@ class CommQMixLocalAgent(nn.Module):
             msg_out = (msg_probs * vocab).sum(dim=-1, keepdim=True)
             msg_indices = msg_probs.argmax(dim=-1, keepdim=True)
 
-        return q_vals, msg_out, msg_indices, h
+        return q_vals, msg_out, msg_indices, h, msg_dist
 
 
 class QMixCommMAC(nn.Module):
@@ -119,6 +115,7 @@ class QMixCommMAC(nn.Module):
         self.msg_buffer = None
         self.rollout_msg_state = None
         self.last_incoming_msgs = None
+        self.last_msg_dist = None        # soft p(m|tau) exposed for the NDQ IB term
 
     def init_buffer(self, batch_size, device):
         self.msg_buffer = torch.zeros(batch_size, self.num_agents, 1, device=device)
@@ -142,8 +139,6 @@ class QMixCommMAC(nn.Module):
                 current_msgs = self.msg_buffer
 
         # ---- PER-EDGE DIRECTIONAL ROUTING ----
-        # slot 0 = message from downstream neighbour (i-1, toward customer)
-        # slot 1 = message from upstream   neighbour (i+1, toward factory)
         Bq, dev = current_msgs.size(0), current_msgs.device
         down = torch.zeros(Bq, self.num_agents, 1, device=dev)
         up = torch.zeros(Bq, self.num_agents, 1, device=dev)
@@ -155,7 +150,7 @@ class QMixCommMAC(nn.Module):
         msg_flat = masked_msgs.reshape(B * self.num_agents, -1)
         hiddens_flat = hiddens.reshape(B * self.num_agents, -1)
 
-        q_vals, msg_out, msg_indices, next_hiddens = self.agent(
+        q_vals, msg_out, msg_indices, next_hiddens, msg_dist = self.agent(
             obs_flat, msg_flat, hiddens_flat, tau=tau, hard=hard, sample=sample)
         msg_out_reshaped = msg_out.reshape(B, self.num_agents, 1)
         safe_logs = msg_indices.reshape(B, self.num_agents, 1).detach().cpu().numpy()
@@ -168,6 +163,9 @@ class QMixCommMAC(nn.Module):
 
         incoming_msgs = masked_msgs.reshape(B, self.num_agents, 2)
         self.last_incoming_msgs = incoming_msgs
+        # Soft message distribution for the NDQ IB term -- exposed as an ATTRIBUTE
+        # so the public return stays a STABLE 5-tuple (no consumer breakage).
+        self.last_msg_dist = msg_dist.reshape(B, self.num_agents, -1)
 
         return (q_vals.reshape(B, self.num_agents, -1),
                 next_hiddens.reshape(B, self.num_agents, -1),

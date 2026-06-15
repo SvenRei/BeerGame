@@ -76,8 +76,8 @@ STATE_FEATURES = {          # sender-state features for MI / heatmaps: obs index
 # One or more checkpoints per comm algo. Lists => per-seed rows in the output
 # (Phase 2: put the five seed checkpoints here and aggregate downstream).
 CHECKPOINTS = {
-    "comm_mappo": [os.path.join(PROJECT_ROOT, "weights_comm_mappo", "run_comm_mappo_05kxz7fb", "comm_mappo_checkpoint_best.pt")],
-    "comm_qmix": [os.path.join(PROJECT_ROOT, "weights_comm_qmix", "run_comm_qmix_krkhtd0e", "comm_qmix_checkpoint_best.pt")],
+    "comm_qplex": [os.path.join(PROJECT_ROOT, "weights_comm_qplex", "run_comm_qplex_9bzrf9nn", "comm_qplex_checkpoint_best.pt")],
+    "comm_qmix": [os.path.join(PROJECT_ROOT, "weights_comm_qmix", "run_comm_qmix_2s129a50", "comm_qmix_checkpoint_best.pt")],
 }
 
 

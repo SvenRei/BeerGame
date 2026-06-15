@@ -31,7 +31,16 @@ tau_min: 0.1   # Gumbel temperature floor; swept in the comm sweeps
 # it (requires vocab_size>1). This REPLACES the old CIC/KL positive-listening
 # bonus, which was gameable by a constant message (single-token collapse).
 # Start ~0.1-0.5; sweep this axis.
-listening_coef: 0.2
 expr_decoder_hidden: 128
 # DEPRECATED: kept only for config/back-compat; no longer used by the loss.
 listening_kl_clip: 2.0
+listening_coef: 0.2     # NDQ Expressiveness
+succinctness_coef: 0.01 # NDQ Parsimony / Information Bottleneck
+# ---- variant selectors (train_comm_qplex.py) ----
+mixer: "qmix"
+reader: "concat"
+qplex_embed: 64
+qplex_heads: 4
+tarmac_key_dim: 16
+tarmac_heads: 4
+normalize_returns: true

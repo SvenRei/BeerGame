@@ -8,6 +8,7 @@ import hydra
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -34,7 +35,8 @@ def _torch_save(obj, path, _retries=6, _delay=5):
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.action_space import index_to_fraction
-from agents.rl.qmix import CommQMixLocalAgent, QMixCommMAC, QMixer, MessageDecoder
+from agents.rl.qmix_qplex_tarmac import (CommQMixAgent, QMixCommMAC, QMixer,
+                                         QPLEXMixer, MessageDecoder, build_mixer)
 
 
 class EpisodeReplayBuffer:
@@ -102,6 +104,25 @@ class RunningMeanStd:
 _RET_RMS = RunningMeanStd()
 
 
+class RunningMeanStd:
+    """Welford running stats for optional return normalization (SB3-style)."""
+    def __init__(self, eps=1e-4):
+        self.mean = 0.0; self.var = 1.0; self.count = eps
+    def update(self, x):
+        x = x.detach()
+        bm = float(x.mean()); bv = float(x.var(unbiased=False)); bc = x.numel()
+        delta = bm - self.mean; tot = self.count + bc
+        self.mean += delta * bc / tot
+        self.var = (self.var * self.count + bv * bc + delta**2 * self.count * bc / tot) / tot
+        self.count = tot
+    @property
+    def std(self):
+        return float(self.var) ** 0.5
+
+
+_RET_RMS = RunningMeanStd()
+
+
 def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all_params, cfg, device, hidden_dim, tau, msg_decoder=None):
     b_states = batch["states"].to(device)
     b_obs = batch["obs"].to(device)
@@ -116,22 +137,21 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
     target_h_train = torch.zeros(B, N, hidden_dim, device=device)
     msg_in = torch.zeros(B, N, 1, device=device)
     target_msg_in = torch.zeros(B, N, 1, device=device)
+    mac.reset_comm_state(B, device)
+    target_mac.reset_comm_state(B, device)
 
     q_evals_list, target_q_evals_list = [], []
     msg_out_list = []
     inc_msg_list = []  # NEW: incoming (post-adjacency) message per agent, per step
-    msg_probs_list = [] # <-- NEW: List to hold the probability distributions
 
     # Online network: hard=False keeps Gumbel-softmax differentiable so gradients
     # flow back through msg_stream. Target network runs inside no_grad.
     for t in range(T_plus_1):
         q_t, h_train, msg_out, _, inc_msg = mac(b_obs[:, t], h_train, tau=tau, msg_in=msg_in, hard=True)
-        msg_probs = mac.last_msg_dist            # SOFT p(m|tau) for the IB term (attribute, stable API)
         msg_in = msg_out  # keep gradient flow through communication
         q_evals_list.append(q_t)
         msg_out_list.append(msg_out)
         inc_msg_list.append(inc_msg)  # [B, N, 1], differentiable -> sender's msg_stream
-        msg_probs_list.append(msg_probs)
 
         with torch.no_grad():
             target_q_t, target_h_train, target_msg_out, _, _ = target_mac(b_obs[:, t], target_h_train, tau=tau, msg_in=target_msg_in, hard=True)
@@ -141,15 +161,16 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
     q_evals = torch.stack(q_evals_list, dim=1)             # [B, T+1, N, A]
     target_q_evals = torch.stack(target_q_evals_list, dim=1)
     
-    chosen_q = q_evals[:, :-1].gather(3, b_actions)       # [B, T, N, 1]
-    best_next_actions = q_evals[:, 1:].argmax(dim=3, keepdim=True)
-    target_q_gathered = target_q_evals[:, 1:].gather(3, best_next_actions)
+    A_dim = q_evals.size(-1)
+    best_next_actions = q_evals[:, 1:].argmax(dim=3, keepdim=True)        # [B,T,N,1]
+    acts_oh = F.one_hot(b_actions.squeeze(-1), A_dim).float()             # [B,T,N,A]
+    best_oh = F.one_hot(best_next_actions.squeeze(-1), A_dim).float()     # [B,T,N,A]
 
     b_states_t = b_states[:, :-1, :]
     b_states_next = b_states[:, 1:, :]
-    q_tot = mixer(chosen_q.reshape(B * T, N, 1), b_states_t.reshape(B * T, -1))
+    q_tot = mixer(q_evals[:, :-1].reshape(B * T, N, A_dim), b_states_t.reshape(B * T, -1), acts_oh.reshape(B * T, N, A_dim))
     with torch.no_grad():
-        target_q_tot = target_mixer(target_q_gathered.reshape(B * T, N, 1), b_states_next.reshape(B * T, -1))
+        target_q_tot = target_mixer(target_q_evals[:, 1:].reshape(B * T, N, A_dim), b_states_next.reshape(B * T, -1), best_oh.reshape(B * T, N, A_dim))
 
     q_tot_flat = q_tot.reshape(B * T, 1)
     targets = b_rewards.reshape(B * T, 1) + cfg.agent.gamma * (1.0 - b_dones.reshape(B * T, 1)) * target_q_tot.reshape(B * T, 1)
@@ -166,35 +187,42 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
         base_loss = nn.functional.smooth_l1_loss(q_tot_flat / scale, targets / scale)
     else:
         base_loss = nn.functional.smooth_l1_loss(q_tot_flat, targets)
-
-    msg_probs_tensor = torch.stack(msg_probs_list, dim=1)[:, :-1] # [B, T, N, vocab] SOFT dist
-    # Define uniform prior (e.g., if vocab is 3, prior is [0.33, 0.33, 0.33])
-    vocab_size_current = msg_probs_tensor.size(-1)
-    prior = torch.ones_like(msg_probs_tensor) / vocab_size_current
-    
-    # Calculate KL Divergence against the prior
-    eps = 1e-8
-    succinctness_kl_loss = (msg_probs_tensor * torch.log((msg_probs_tensor + eps) / prior)).sum(dim=-1).mean()
-    
-    # Apply coefficient (Default to 0.01 if not in config)
-    succinctness_coef = cfg.agent.get("succinctness_coef", 0.01) 
-    ib_penalty = succinctness_coef * succinctness_kl_loss
+    msg_outs_tensor = torch.stack(msg_out_list, dim=1) # Shape: [B, T+1, N, 1]
+    comm_penalty = cfg.agent.comm_penalty_coef * (msg_outs_tensor ** 2).mean()
 
     listening_coef = cfg.agent.get("listening_coef", 0.0)
+    # ------------------------------------------------------------------
+    # NDQ EXPRESSIVENESS ("listening") LOSS  (Wang et al., ICLR 2020, Eq. 3/7)
+    #
+    # We REPLACE the old CIC/KL positive-listening bonus. That objective rewarded
+    # ANY divergence between the with-message and zero-message policy, so a
+    # CONSTANT (information-free) message could maximise it -> single-token
+    # collapse. Here instead we train a shared decoder q_xi(a_j | o_j, m_in_j) to
+    # predict the receiver's greedy action from its own obs + the incoming
+    # message, and minimise the cross-entropy. The gradient w.r.t. the incoming
+    # message flows into the sender's msg_stream, so the channel is pushed to
+    # carry receiver-decision-relevant information. A constant message cannot
+    # beat the obs-only baseline, so this is NOT gameable by collapse.
+    #
+    # NOTE: in QMIX the mixer already sees the global state, so the TD loss alone
+    # gives ~0 gradient to the message head (messages are redundant for fitting
+    # Q_tot). This decentralised auxiliary loss is what actually trains the channel.
+    # ------------------------------------------------------------------
     expr_loss = torch.tensor(0.0, device=device)
     if listening_coef > 0.0 and cfg.agent.get("vocab_size", 3) > 1 and msg_decoder is not None:
-        inc_msgs = torch.stack(inc_msg_list, dim=1)[:, :-1]      
-        obs_scaled = b_obs[:, :-1] / 100.0                       
-        logits = msg_decoder(obs_scaled, inc_msgs)              
+        inc_msgs = torch.stack(inc_msg_list, dim=1)[:, :-1]      # [B, T, N, 1] differentiable
+        obs_scaled = b_obs[:, :-1] / 100.0                       # [B, T, N, obs] (match agent's /100 scaling)
+        logits = msg_decoder(obs_scaled, inc_msgs)              # [B, T, N, A]
         with torch.no_grad():
-            teacher = q_evals[:, :-1].argmax(dim=-1)            
+            # p(A_j | .) proxy: receiver's own informed (with-message) greedy action.
+            teacher = q_evals[:, :-1].argmax(dim=-1)            # [B, T, N]
         A = logits.size(-1)
         expr_loss = nn.functional.cross_entropy(
             logits.reshape(-1, A), teacher.reshape(-1)
         )
 
-    # Combine losses (Base Q-learning + Bottleneck Penalty + Expressiveness Bonus)
-    loss = base_loss + ib_penalty + (listening_coef * expr_loss)
+    # Minimise expressiveness CE (note: + sign, unlike the old maximised KL term).
+    loss = base_loss + comm_penalty + listening_coef * expr_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -215,7 +243,7 @@ def main(cfg: DictConfig):
     base_seed = cfg.get("seed", 1000)
     set_global_seeds(base_seed)
 
-    run = wandb.init(project="BeerGame_Research", name="comm_qmix")
+    run = wandb.init(project="BeerGame_Research", name="comm_qplex")
     # Sweep optimizes the run summary of Avg_Cost_50; take the BEST (min) over the run,
     # not the noisy last value (critical for the high-variance QMIX family).
     wandb.define_metric("Avg_Cost_50", summary="min")
@@ -235,7 +263,7 @@ def main(cfg: DictConfig):
     obs, _ = env.reset(seed=base_seed)
     state_dim = len(env.get_global_state())
 
-    run_dir = os.path.join(_PROJECT_ROOT, "weights_comm_qmix", f"run_{run.name}_{run.id}")
+    run_dir = os.path.join(_PROJECT_ROOT, "weights_comm_qplex", f"run_{run.name}_{run.id}")
     os.makedirs(run_dir, exist_ok=True)
 
     local_dim = env.observation_space("retailer").shape[0]
@@ -252,13 +280,17 @@ def main(cfg: DictConfig):
     num_agents = len(env.possible_agents)
     agent_names = env.possible_agents
 
-    base_agent = CommQMixLocalAgent(local_dim, hidden_dim, n_actions, vocab_size=vocab_size)
-    mac = QMixCommMAC(base_agent, num_agents=num_agents).to(device)
-    mixer = QMixer(num_agents, state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
+    reader = cfg.agent.get("reader", "concat")          # concat | tarmac
+    mixer_kind = cfg.agent.get("mixer", "qmix")          # qmix | qplex
+    key_dim = cfg.agent.get("tarmac_key_dim", 16); n_heads = cfg.agent.get("tarmac_heads", 4)
+    def _mk_agent():
+        return CommQMixAgent(local_dim, hidden_dim, n_actions, vocab_size=vocab_size,
+                             reader=reader, key_dim=key_dim, n_heads=n_heads)
+    mac = QMixCommMAC(_mk_agent(), num_agents=num_agents).to(device)
+    mixer = build_mixer(mixer_kind, num_agents, state_dim, n_actions, cfg).to(device)
 
-    target_base = CommQMixLocalAgent(local_dim, hidden_dim, n_actions, vocab_size=vocab_size)
-    target_mac = QMixCommMAC(target_base, num_agents=num_agents).to(device)
-    target_mixer = QMixer(num_agents, state_dim, cfg.agent.mixing_embed_dim, cfg.agent.hypernet_embed).to(device)
+    target_mac = QMixCommMAC(_mk_agent(), num_agents=num_agents).to(device)
+    target_mixer = build_mixer(mixer_kind, num_agents, state_dim, n_actions, cfg).to(device)
 
     target_mac.load_state_dict(mac.state_dict())
     target_mixer.load_state_dict(mixer.state_dict())
@@ -285,7 +317,7 @@ def main(cfg: DictConfig):
     tau_start, tau_min = 1.0, cfg.agent.get("tau_min", 0.1)
     tau_decay_episodes = cfg.agent.get("tau_decay_episodes", cfg.total_episodes * 0.5)
 
-    print("--- Starting COMM_QMIX Sequence Replay Training ---")
+    print("--- Starting COMM_QPLEX Sequence Replay Training ---")
 
     for ep in range(cfg.total_episodes):
         tau = tau_min if ep >= tau_decay_episodes else tau_start - (tau_start - tau_min) * (ep / tau_decay_episodes)

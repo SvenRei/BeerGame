@@ -124,22 +124,34 @@ ENV_BASE = {"horizon": 50, "max_order": 100, "holding_cost": 0.5,
 # ------------------------------------------------------------------------------
 # CHECKPOINT LOCATIONS
 # ------------------------------------------------------------------------------
-# Each entry is a LIST of candidate paths tried in order (FIX 3: final preferred,
-# best as fallback). Point these at the Phase-2 winners' run directories. The
-# *_checkpoint_*.pt files embed the resolved training config, so hidden_dim /
-# n_actions / vocab_size / action_mode / tau are auto-detected from the file.
+# Mirror comm_analysis.py: point each algo at the RUN-SPECIFIC best checkpoint
+# under weights_<algo>/run_<algo>_<RUN_ID>/. Fill in the wandb run-id per algo
+# below so the benchmark loads the exact run that produced your reported curves
+# (the flat weights_<algo>/*_final.pt the trainer never writes was the source of
+# the earlier eval/training cost mismatch). The *_checkpoint_best.pt embeds the
+# resolved training config, so hidden_dim / n_actions / vocab_size / action_mode
+# / tau are auto-detected from the file. We use *best* (not final) because runs
+# drift upward after their best -- best is the policy you actually want to report.
 # ------------------------------------------------------------------------------
-def _candidates(algo):
-    d = os.path.join(PROJECT_ROOT, f"weights_{algo}")
-    return [os.path.join(d, f"{algo}_checkpoint_final.pt"),   # FIX 3: converged policy first
-            os.path.join(d, f"{algo}_checkpoint_best.pt")]    # fallback: best-Avg_Cost_50 snapshot
-
-MODEL_PATHS = {
-    "mappo":      _candidates("mappo"),
-    "comm_mappo": _candidates("comm_mappo"),
-    "qmix":       _candidates("qmix"),
-    "comm_qmix":  _candidates("comm_qmix"),
+RUN_IDS = {                       # <-- FILL IN the wandb run-id for each algo
+    "mappo":      "qv9mogsd",
+    "comm_mappo": "fk6a673o",
+    "qmix":       "zwyxkuew",
+    "comm_qmix":  "krkhtd0e",
+    "comm_qplex": "9bzrf9nn",   # train_comm_qplex.py with agent.mixer=qplex
 }
+
+
+CHECKPOINTS = {
+    "mappo":      [os.path.join(PROJECT_ROOT, "weights_mappo",      f"run_mappo_{RUN_IDS['mappo']}",           "mappo_checkpoint_best.pt")],
+    "comm_mappo": [os.path.join(PROJECT_ROOT, "weights_comm_mappo", f"run_comm_mappo_{RUN_IDS['comm_mappo']}", "comm_mappo_checkpoint_best.pt")],
+    "qmix":       [os.path.join(PROJECT_ROOT, "weights_qmix",       f"run_qmix_{RUN_IDS['qmix']}",             "qmix_checkpoint_best.pt")],
+    "comm_qmix":  [os.path.join(PROJECT_ROOT, "weights_comm_qmix",  f"run_comm_qmix_{RUN_IDS['comm_qmix']}",   "comm_qmix_checkpoint_best.pt")],
+    "comm_qplex": [os.path.join(PROJECT_ROOT, "weights_comm_qplex",  f"run_comm_qmix_{RUN_IDS['comm_qplex']}",  "comm_qplex_checkpoint_best.pt")],
+}
+
+
+MODEL_PATHS = CHECKPOINTS         # kept name for the rest of the module / _resolve_path
 
 # Sterman (1989) anchoring-and-adjustment ordering rule (supply-line aware baseline):
 #   O = max(0, D_hat + alpha_S*(S' - S) + alpha_SL*(SL' - SL))
@@ -433,14 +445,36 @@ class CommQmixPolicy:
     name = "comm_qmix"
 
     def __init__(self, env, mac_statedict, hidden, n_actions, vocab, ablate=False,
-                 action_kw=None, eval_tau=0.1):
+                 action_kw=None, eval_tau=0.1, key_dim=16, n_heads=4):
         self.hidden_dim, self.n_actions, self.ablate = hidden, n_actions, ablate
         self.max_order = env.max_order
         self.act_kw = action_kw or {}
         self.eval_tau = float(eval_tau)                     # FIX 1
+        self._key_dim, self._n_heads = key_dim, n_heads     # tarmac reader dims (from cfg)
         local_dim = env.observation_space("retailer").shape[0]
-        base = CommQMixLocalAgent(local_dim, hidden, n_actions, vocab_size=vocab)
-        self.mac = QMixCommMAC(base, num_agents=len(AGENTS)).to(DEVICE)
+
+        # Detect which classes SAVED this checkpoint, from the state_dict keys.
+        # The mixer (qmix vs qplex) is irrelevant here -- it is never loaded for
+        # greedy execution -- but the AGENT/MAC classes must match what trained.
+        keys = list(mac_statedict.keys())
+        is_tarmac  = any(("token_embed" in k) or ("key_stream" in k) for k in keys)
+        is_variant = is_tarmac or any("nbr_mask" in k for k in keys) \
+                                or not any("adj_mask" in k for k in keys)
+
+        if is_variant:
+            # trained with train_comm_qplex.py (qmix_qplex_tarmac classes)
+            from agents.rl.qmix_qplex_tarmac import (CommQMixAgent as _VarAgent,
+                                                     QMixCommMAC as _VarMAC)
+            reader = "tarmac" if is_tarmac else "concat"
+            key_dim = int(getattr(self, "_key_dim", 16))
+            n_heads = int(getattr(self, "_n_heads", 4))
+            base = _VarAgent(local_dim, hidden, n_actions, vocab_size=vocab,
+                             reader=reader, key_dim=key_dim, n_heads=n_heads)
+            self.mac = _VarMAC(base, num_agents=len(AGENTS)).to(DEVICE)
+        else:
+            base = CommQMixLocalAgent(local_dim, hidden, n_actions, vocab_size=vocab)
+            self.mac = QMixCommMAC(base, num_agents=len(AGENTS)).to(DEVICE)
+
         self.mac.load_state_dict(mac_statedict)
         self.mac.eval()
         self.msg_tokens = {a: 0 for a in AGENTS}
@@ -454,8 +488,9 @@ class CommQmixPolicy:
         # ablate -> force a zero incoming-message vector (constant neutral token)
         msg_in = torch.zeros(1, len(AGENTS), 1, device=DEVICE) if self.ablate else None
         with torch.no_grad():
-            q, next_h, _mo, safe_logs = self.mac(o, self.h, tau=self.eval_tau,   # FIX 1
-                                                 msg_in=msg_in, hard=True)
+            # Capture all outputs in a tuple, then slice exactly the 4 we need for evaluation
+            mac_out = self.mac(o, self.h, tau=self.eval_tau, hard=True)
+            q, next_h, _mo, safe_logs = mac_out[:4]
             self.h = next_h
         toks = safe_logs.reshape(len(AGENTS))
         self.msg_tokens = {a: int(toks[i]) for i, a in enumerate(AGENTS)}
@@ -499,15 +534,19 @@ def build_policy(name, env, ablate=False, ckpt_path=None):
                 any_sd = next(iter(mac_dict.values()))
                 hidden, n_actions = any_sd["advantage_stream.weight"].shape[1], any_sd["advantage_stream.weight"].shape[0]
             return QmixPolicy(env, mac_dict, hidden, n_actions, action_kw=action_kw)
-        if name == "comm_qmix":
+        if name in ("comm_qmix", "comm_qplex"):
             sd = payload["mac"] if kind == "checkpoint" else payload
             if cfg is None:
                 hidden = sd["agent.advantage_stream.weight"].shape[1]
                 n_actions = sd["agent.advantage_stream.weight"].shape[0]
                 vocab = sd["agent.msg_stream.weight"].shape[0]
             eval_tau = _cfg_eval_tau(payload if kind == "checkpoint" else None, cfg)   # FIX 1
+            _ag = (cfg or {}).get("agent", {}) if isinstance(cfg, dict) else {}
+            key_dim = int(_ag.get("tarmac_key_dim", 16))
+            n_heads = int(_ag.get("tarmac_heads", 4))
             return CommQmixPolicy(env, sd, hidden, n_actions, vocab, ablate=ablate,
-                                  action_kw=action_kw, eval_tau=eval_tau)
+                                  action_kw=action_kw, eval_tau=eval_tau,
+                                  key_dim=key_dim, n_heads=n_heads)
     except Exception as e:    # corrupt/mismatched checkpoint -> skip, don't abort the run
         print(f"  [skip] {name}: failed to load ({type(e).__name__}: {e})")
         return None
@@ -626,7 +665,7 @@ def main():
     print(f"  agents: sterman, base_stock, mappo, comm_mappo, qmix, comm_qmix | episodes/scenario: {N_EPISODES}")
     print("=" * 70)
 
-    order = ["sterman", "base_stock", "mappo", "comm_mappo", "qmix", "comm_qmix"]
+    order = ["sterman", "base_stock", "mappo", "comm_mappo", "qmix", "comm_qmix", "comm_qplex"]
 
     for scenario in SCENARIOS:
         print(f"\n---> SCENARIO: {scenario.upper()}")
@@ -658,7 +697,7 @@ def main():
         # suite (zero / marginal-shuffle / uniform-random + per-decision causal
         # influence) is in scripts/comm_analysis.py.
         comm_value, comm_value_p = {}, {}
-        for name in ("comm_mappo", "comm_qmix"):
+        for name in ("comm_mappo", "comm_qmix", "comm_qplex"):
             if name not in results:
                 continue
             pol_abl = build_policy(name, env, ablate=True)
@@ -685,7 +724,7 @@ def main():
             toks = np.concatenate([e["tokens"] for e in eps]) if eps[0]["tokens"] else np.array([])
             rtok = np.concatenate([e["ret_tokens"] for e in eps]) if eps[0]["ret_tokens"] else np.array([])
             rbck = np.concatenate([e["ret_backlogs"] for e in eps]) if eps[0]["ret_backlogs"] else np.array([])
-            is_comm = name in ("comm_mappo", "comm_qmix")
+            is_comm = name in ("comm_mappo", "comm_qmix", "comm_qplex")
 
             rows.append({
                 "Scenario": scenario.upper(), "Algo": name.upper(),
