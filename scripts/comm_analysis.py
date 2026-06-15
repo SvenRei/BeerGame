@@ -76,8 +76,8 @@ STATE_FEATURES = {          # sender-state features for MI / heatmaps: obs index
 # One or more checkpoints per comm algo. Lists => per-seed rows in the output
 # (Phase 2: put the five seed checkpoints here and aggregate downstream).
 CHECKPOINTS = {
-    "comm_mappo": [os.path.join(PROJECT_ROOT, "weights_comm_mappo", "comm_mappo_checkpoint_final.pt")],
-    "comm_qmix":  [os.path.join(PROJECT_ROOT, "weights_comm_qmix",  "comm_qmix_checkpoint_final.pt")],
+    "comm_mappo": [os.path.join(PROJECT_ROOT, "weights_comm_mappo", "run_comm_mappo_05kxz7fb", "comm_mappo_checkpoint_best.pt")],
+    "comm_qmix": [os.path.join(PROJECT_ROOT, "weights_comm_qmix", "run_comm_qmix_krkhtd0e", "comm_qmix_checkpoint_best.pt")],
 }
 
 
@@ -153,7 +153,7 @@ def rollout_with_condition(policy, env, seed, condition, record_states=False):
                 # explicit msg_in: MAC consumes it and does NOT touch its own
                 # rollout state -- we own the message state entirely.
                 q, next_h, msg_out, safe_logs, _ = mac(o, policy.h, tau=policy.eval_tau,
-                                                    msg_in=fed, hard=True)
+                                                    msg_in=fed, hard=True, sample=False)
                 head = q
             else:                              # comm_mappo: MAC reads self.msg_buffer
                 mac.msg_buffer = fed.clone()   # inject the (possibly intervened) incoming msgs
@@ -250,7 +250,7 @@ def _action_probs(policy, mac, o, h, fed):
     WITHOUT advancing any state (hidden/message buffers restored by caller)."""
     with torch.no_grad():
         if policy.name == "comm_qmix":
-            q, _h, _m, _l, _inc  = mac(o, h, tau=policy.eval_tau, msg_in=fed, hard=True)
+            q, _h, _m, _l, _inc  = mac(o, h, tau=policy.eval_tau, msg_in=fed, hard=True, sample=False)
             return torch.softmax(q[0], dim=-1)            # Boltzmann(Q, T=1): a distance proxy
         saved = mac.msg_buffer.clone() if mac.msg_buffer is not None else None
         mac.msg_buffer = fed.clone()
@@ -292,7 +292,7 @@ def test3_influence(policy, env, vocab_values):
             with torch.no_grad():
                 if policy.name == "comm_qmix":
                     q, next_h, msg_out, _, _  = mac(o, policy.h, tau=policy.eval_tau,
-                                                msg_in=true_msgs, hard=True)
+                                                msg_in=true_msgs, hard=True, sample=False)
                     head = q
                 else:
                     mac.msg_buffer = true_msgs.clone()

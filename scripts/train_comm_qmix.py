@@ -89,14 +89,14 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
     # Online network: hard=False keeps Gumbel-softmax differentiable so gradients
     # flow back through msg_stream. Target network runs inside no_grad.
     for t in range(T_plus_1):
-        q_t, h_train, msg_out, _, inc_msg = mac(b_obs[:, t], h_train, tau=tau, msg_in=msg_in, hard=False)
+        q_t, h_train, msg_out, _, inc_msg = mac(b_obs[:, t], h_train, tau=tau, msg_in=msg_in, hard=True)
         msg_in = msg_out  # keep gradient flow through communication
         q_evals_list.append(q_t)
         msg_out_list.append(msg_out)
-        inc_msg_list.append(inc_msg)  # [B, N, 1], differentiable -> sender's msg_stream
+        inc_msg_list.append(inc_msg)  # [B, N, 2], differentiable -> sender's msg_stream
 
         with torch.no_grad():
-            target_q_t, target_h_train, target_msg_out, _, _ = target_mac(b_obs[:, t], target_h_train, tau=tau, msg_in=target_msg_in, hard=False)
+            target_q_t, target_h_train, target_msg_out, _, _ = target_mac(b_obs[:, t], target_h_train, tau=tau, msg_in=target_msg_in, hard=True)
             target_msg_in = target_msg_out
             target_q_evals_list.append(target_q_t)
 
@@ -139,7 +139,7 @@ def update_comm_qmix(batch, mac, target_mac, mixer, target_mixer, optimizer, all
     # ------------------------------------------------------------------
     expr_loss = torch.tensor(0.0, device=device)
     if listening_coef > 0.0 and cfg.agent.get("vocab_size", 3) > 1 and msg_decoder is not None:
-        inc_msgs = torch.stack(inc_msg_list, dim=1)[:, :-1]      # [B, T, N, 1] differentiable
+        inc_msgs = torch.stack(inc_msg_list, dim=1)[:, :-1]      # [B, T, N, 2] differentiable
         obs_scaled = b_obs[:, :-1] / 100.0                       # [B, T, N, obs] (match agent's /100 scaling)
         logits = msg_decoder(obs_scaled, inc_msgs)              # [B, T, N, A]
         with torch.no_grad():
@@ -223,7 +223,7 @@ def main(cfg: DictConfig):
     # NDQ expressiveness decoder q_xi(a_j | o_j, m_in_j). Shared across agents
     # (like NDQ's shared variational posterior). Trained jointly via the optimizer.
     expr_decoder_hidden = cfg.agent.get("expr_decoder_hidden", 128)
-    msg_decoder = MessageDecoder(local_dim, n_actions, hidden=expr_decoder_hidden).to(device)
+    msg_decoder = MessageDecoder(local_dim, n_actions, msg_dim=2, hidden=expr_decoder_hidden).to(device)
 
     all_params = list(mixer.parameters()) + list(mac.parameters()) + list(msg_decoder.parameters())
     optimizer = optim.Adam(all_params, lr=cfg.agent.lr)
