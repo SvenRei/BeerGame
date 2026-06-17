@@ -1,0 +1,45 @@
+algorithm: "draco"
+hidden_dim: 128
+n_actions: 21          # unused by DRACO (continuous base-stock head) but kept for env/config parity
+action_mode: "absolute"
+abs_cap: 40
+centered_range: 10
+
+# --- DRACO modules ---
+z_dim: 8               # B: latent demand-belief size
+msg_dim: 4             # C: continuous neighbour message size
+n_quantiles: 8         # D: distributional critic quantiles
+cvar_alpha: 0.2        # D: tail level (worst 20%)
+risk_eta: 0.5          # D: 0=risk-neutral mean ... 1=pure CVaR; blend to avoid over-conservatism
+ib_beta: 0.001         # B: information-bottleneck weight
+pred_coef: 1.0         # B: next-demand prediction weight
+msg_penalty_coef: 0.0001  # C: message parsimony
+
+# --- demand randomization (E) ---
+dr_lambda_lo: 4.0
+dr_lambda_hi: 16.0
+dr_p_shift: 0.5
+dr_shift_scale: 2.0
+
+# --- PPO / HAPPO core ---
+lr_actor: 3e-4
+lr_critic: 1e-3
+lr_encoder: 3e-4
+gamma: 0.99
+gae_lambda: 0.95
+k_epochs: 4
+eps_clip: 0.2
+entropy_coef: 0.01
+max_grad_norm: 0.5
+
+reward_scale: 100
+batch_episodes: 8       # episodes accumulated per update (variance control; 8-16)
+s_bias_init: 40.0       # base-stock warm-start (sim optimum ~44; cost asymmetry favours high S)
+s_logstd_init: 1.0      # initial exploration std on the target level (std=exp(1.0)~2.7)
+use_comm: true          # false = isolate base-stock core (no messages) -- use for Stage-1 bring-up
+use_context: true       # false = actor sees zero belief z
+warm_up_episodes: 500
+patience: 3000
+lr_scheduler_step: 2000
+lr_scheduler_gamma: 0.5
+trace_every: 0         # set >0 (e.g. 250) to dump per-step trace CSVs for symbolic regression
